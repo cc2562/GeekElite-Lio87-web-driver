@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { Leo87Connection, type HidDevice, type HidInputEvent } from './device'
+import { Lio87Connection, type HidDevice, type HidInputEvent } from './device'
 import { chunks, readPacket } from './protocol'
 import { macroPacket, MacroLayoutError, MACRO_HEADER_PROBE, parseMacroStorage, replaceMacro } from './macro'
 
@@ -29,7 +29,7 @@ function liveMacroStorage(): Uint8Array {
 class FakeDevice implements HidDevice {
   vendorId = 0x320f
   productId = 0x5055
-  productName = 'GeekElite Leo87'
+  productName = 'GeekElite Lio 87'
   opened = false
   collections = [{ usagePage: 0xff1c, usage: 0x92, inputReports: [{ reportId: 4 }], outputReports: [{ reportId: 4 }] }]
   reports: Uint8Array[] = []
@@ -94,11 +94,11 @@ class FakeDevice implements HidDevice {
   }
 }
 
-describe('Leo87Connection', () => {
+describe('Lio87Connection', () => {
   afterEach(() => vi.useRealTimers())
   it('读取完整键位并逐段验证', async () => {
     const fake = new FakeDevice()
-    const connection = new Leo87Connection(fake)
+    const connection = new Lio87Connection(fake)
     await connection.open()
     expect(await connection.readKeymap()).toEqual(fake.memory)
     expect(fake.reports.map(report => report[2])).toEqual([1, 3, ...Array(7).fill(8), 2])
@@ -107,7 +107,7 @@ describe('Leo87Connection', () => {
   it('写入时始终发送完整七段并回读', async () => {
     const fake = new FakeDevice()
     fake.acknowledgeWrites = true
-    const connection = new Leo87Connection(fake)
+    const connection = new Lio87Connection(fake)
     const target = new Uint8Array(384).fill(0x20)
     expect(await connection.writeAndVerify(target)).toEqual({ readback: target, mismatchOffset: null, readError: null })
     expect(fake.reports.map(report => report[2])).toEqual([1, ...Array(7).fill(9), 2, 1, 3, ...Array(7).fill(8), 2])
@@ -118,7 +118,7 @@ describe('Leo87Connection', () => {
   it('中途失败不发送 Commit；错位响应被拒绝', async () => {
     const fake = new FakeDevice()
     fake.failAtSet = 2
-    const connection = new Leo87Connection(fake)
+    const connection = new Lio87Connection(fake)
     await expect(connection.writeAndVerify(new Uint8Array(384))).rejects.toThrow('模拟写入中断')
     expect(fake.reports.map(report => report[2])).toEqual([1, 9, 9])
     fake.wrongOffset = true
@@ -128,7 +128,7 @@ describe('Leo87Connection', () => {
   it('0x08 回读未反映写入时报告待确认，而非断言设备未写入', async () => {
     const fake = new FakeDevice()
     fake.staleGet = true
-    const result = await new Leo87Connection(fake).writeAndVerify(new Uint8Array(384).fill(0x20))
+    const result = await new Lio87Connection(fake).writeAndVerify(new Uint8Array(384).fill(0x20))
     expect(result.mismatchOffset).toBe(0)
     expect(result.readError).toBeNull()
     expect(fake.reports.filter(report => report[2] === 9)).toHaveLength(7)
@@ -137,7 +137,7 @@ describe('Leo87Connection', () => {
   it('Commit 后的 0x08 回读异常被标为未确认，不再误报写入中断', async () => {
     const fake = new FakeDevice()
     fake.wrongOffset = true
-    const result = await new Leo87Connection(fake).writeAndVerify(new Uint8Array(384))
+    const result = await new Lio87Connection(fake).writeAndVerify(new Uint8Array(384))
     expect(result.readback).toBeNull()
     expect(result.readError).toContain('不匹配')
     expect(fake.reports.some(report => report[2] === 2)).toBe(true)
@@ -148,7 +148,7 @@ describe('Leo87Connection', () => {
     const map = new Uint8Array(384)
     // record 63 → 颜色表偏移 189（0xBD），落在 0x00A8 这一分段里。
     map.set([0, 215, 15], 63 * 3)
-    await new Leo87Connection(fake).setCustomColorMap(map, { effectId: 0x05, brightness: 4, speed: 1, mode: 'cycle', color: { r: 255, g: 0, b: 0 } })
+    await new Lio87Connection(fake).setCustomColorMap(map, { effectId: 0x05, brightness: 4, speed: 1, mode: 'cycle', color: { r: 255, g: 0, b: 0 } })
 
     expect(fake.reports.map(report => report[2])).toEqual([1, 6, ...Array(7).fill(0x0b), 2])
     const lighting = fake.reports[1]
@@ -168,7 +168,7 @@ describe('Leo87Connection', () => {
 
   it('逐键颜色长度非法时不发报文；中途失败时不发送结束帧', async () => {
     const fake = new FakeDevice()
-    const connection = new Leo87Connection(fake)
+    const connection = new Lio87Connection(fake)
     const lighting = { effectId: 0x06, brightness: 4, speed: 1, mode: 'static' as const, color: { r: 0, g: 0, b: 0 } }
     await expect(connection.setCustomColorMap(new Uint8Array(383), lighting)).rejects.toThrow('384 字节')
     expect(fake.reports).toHaveLength(0)
@@ -180,7 +180,7 @@ describe('Leo87Connection', () => {
 
   it('按 used_end 分段读取完整宏存储', async () => {
     const fake = new FakeDevice()
-    const result = await new Leo87Connection(fake).readMacroStorage()
+    const result = await new Lio87Connection(fake).readMacroStorage()
     expect(result).toEqual(sampleMacroStorage())
     expect(fake.reports.map(report => [report[2], report[3], report[4]])).toEqual([[0x14, 56, 0], [0x14, 28, 56]])
   })
@@ -188,7 +188,7 @@ describe('Leo87Connection', () => {
   it('entry_count = 1 的实机样本只发一段 0x14 读取', async () => {
     const fake = new FakeDevice()
     fake.macroMemory.set(liveMacroStorage(), 0)
-    const result = await new Leo87Connection(fake).readMacroStorage()
+    const result = await new Lio87Connection(fake).readMacroStorage()
     const parsed = parseMacroStorage(result)
     expect(result).toEqual(liveMacroStorage())
     expect(parsed.entryCount).toBe(1)
@@ -201,7 +201,7 @@ describe('Leo87Connection', () => {
     const fake = new FakeDevice()
     const original = parseMacroStorage(sampleMacroStorage())
     const target = replaceMacro(original, 0, Array.from({ length: 20 }, (_, index) => ({ delayMs: index, pressed: index % 2 === 0, usage: 4 })))
-    const result = await new Leo87Connection(fake).writeMacroAndVerify(target)
+    const result = await new Lio87Connection(fake).writeMacroAndVerify(target)
     expect(result).toEqual(target)
     expect(fake.reports.filter(report => report[2] === 0x15)).toHaveLength(Math.ceil(target.length / 56))
     expect(fake.reports.findIndex(report => report[2] === 0x15)).toBeGreaterThanOrEqual(Math.ceil(target.length / 56))
@@ -211,26 +211,26 @@ describe('Leo87Connection', () => {
     const failed = new FakeDevice()
     failed.failAtMacroSet = 2
     const target = replaceMacro(parseMacroStorage(sampleMacroStorage()), 0, Array.from({ length: 20 }, () => ({ delayMs: 1, pressed: true, usage: 4 })))
-    await expect(new Leo87Connection(failed).writeMacroAndVerify(target)).rejects.toThrow('模拟宏写入中断')
+    await expect(new Lio87Connection(failed).writeMacroAndVerify(target)).rejects.toThrow('模拟宏写入中断')
     expect(failed.reports.filter(report => report[2] === 0x15)).toHaveLength(2)
     expect(failed.reports.some(report => report[2] === 9)).toBe(false)
 
     const stale = new FakeDevice()
     stale.macroIgnoreWrites = true
-    await expect(new Leo87Connection(stale).writeMacroAndVerify(target)).rejects.toThrow('回读不一致')
+    await expect(new Lio87Connection(stale).writeMacroAndVerify(target)).rejects.toThrow('回读不一致')
     expect(stale.reports.some(report => report[2] === 9)).toBe(false)
   })
 
   it('宏错位响应被拒绝', async () => {
     const fake = new FakeDevice()
     fake.macroWrongOffset = true
-    await expect(new Leo87Connection(fake).readMacroStorage()).rejects.toThrow('不匹配')
+    await expect(new Lio87Connection(fake).readMacroStorage()).rejects.toThrow('不匹配')
   })
 
   it('used_end 越界时带走原始探测样本，且不写入后可继续读取', async () => {
     const fake = new FakeDevice()
     fake.macroMemory.set([0xaa, 0x55, 0x0a, 0x00, 0x01, 0x00], 0)
-    const connection = new Leo87Connection(fake)
+    const connection = new Lio87Connection(fake)
     let caught: unknown
     try { await connection.readMacroStorage() } catch (error) { caught = error }
     expect(caught).toBeInstanceOf(MacroLayoutError)
@@ -251,7 +251,7 @@ describe('Leo87Connection', () => {
     vi.useFakeTimers()
     const fake = new FakeDevice()
     fake.suppressMacroResponses = true
-    const assertion = expect(new Leo87Connection(fake).readMacroStorage()).rejects.toThrow('读取超时')
+    const assertion = expect(new Lio87Connection(fake).readMacroStorage()).rejects.toThrow('读取超时')
     await vi.advanceTimersByTimeAsync(1200)
     await assertion
     expect(fake.reports.filter(report => report[2] === 0x14)).toHaveLength(1)

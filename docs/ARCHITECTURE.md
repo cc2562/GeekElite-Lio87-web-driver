@@ -1,12 +1,12 @@
-# Leo87 Studio 架构说明
+# Lio 87 Studio 架构说明
 
 ## 1. 项目目标
 
-Leo87 Studio 是运行在桌面 Chrome 或 Edge 中的非官方网页驱动。浏览器通过 WebHID 直接访问 GeekElite Leo87 的厂商配置接口，所有配置数据仅在网页、浏览器本地存储和键盘之间流动。
+Lio 87 Studio 是运行在桌面 Chrome 或 Edge 中的非官方网页驱动。浏览器通过 WebHID 直接访问 GeekElite Lio 87 的厂商配置接口，所有配置数据仅在网页、浏览器本地存储和键盘之间流动。
 
 当前主要能力包括：
 
-- 连接和识别 Leo87 配置接口；
+- 连接和识别 Lio 87 配置接口；
 - 灯效（动画）与逐键颜色设置；
 - 读取、展示和完整写回 keymap；
 - 键位、滚轮和媒体动作配置；
@@ -17,7 +17,7 @@ Leo87 Studio 是运行在桌面 Chrome 或 Edge 中的非官方网页驱动。�
 
 ```mermaid
 flowchart TD
-    UI[React UI / App.tsx]
+    UI[React UI / App.tsx + hooks + views]
     KM[keymap.ts]
     MP[macro.ts]
     LT[lighting.ts]
@@ -25,7 +25,7 @@ flowchart TD
     DEV[device.ts]
     BK[backup.ts / macroBackup.ts / colorMapBackup.ts]
     HID[WebHID Report ID 4]
-    KB[Leo87 Firmware]
+    KB[Lio 87 Firmware]
 
     UI --> KM
     UI --> MP
@@ -106,25 +106,25 @@ flowchart TD
 
 宏模块额外提供不经过布局校验的导出：`downloadRawMacro` 保存设备真实回送的原始转储，`downloadMacroReport` 保存诊断报告文本；只有 `downloadMacro` 会对字节做完整校验。这样在布局尚未确认时也能留证据，同时不给写入路径开口子。
 
-### `src/App.tsx`
+### `src/App.tsx`、`src/hooks/` 与 `src/views/`
 
-负责页面状态和工作流：
+界面层在 UI 重构后拆分为「外壳 + 会话层 + 视图层 + 复用组件层」，设备协议与备份模块保持不变：
 
-- 设备连接、重新读取和断开；
-- 灯光表单：灯效网格、亮度与速度档位、颜色与 RGB 轮换；
-- 键位面板的「改键 / 逐键颜色」模式切换、逐键取色、差异预览、应用与颜色表导入导出；
-- 键位选择、暂存、差异预览和写入；
-- M1–M10 选择、实时录制、延时修改和保存；
-- 宏触发绑定；
-- keymap 与宏的导入、导出和恢复；
-- 将宏读取错误限制在宏区域，不影响键位和灯光。
+- `src/App.tsx`：应用外壳，只负责顶部导航的视图切换（`lighting` / `keymap` / `macro` / `data`）、全局提示与底部信息。
+- `src/hooks/useLio87Session.ts`：设备会话层。集中承载全部跨页状态与工作流——连接、重新读取、断开，`operate()` 的 busy 互斥与「写入失败即断开设备」语义，键位草稿与差异，灯光与逐键颜色，板载宏读取 / 录制 / 写回，以及各类备份的导入导出。
+- `src/views/`：四个视图组件（`LightingView`、`KeymapView`、`MacroView`、`DataView`），从会话层取数、纯展示 + 事件回调。每个可编辑视图在右上角悬浮 `SaveButton`，点击后弹窗列出本次将要修改的内容，确认后才执行写入。
+- `src/components/app/`：`TopNav`（视图切换与连接状态）、`NoticeBar`（提示分级）、`PageHeader`、`SaveButton`（悬浮保存 + 变更确认弹窗）。
+- `src/components/keyboard/`：拟物键盘组件。`SkeuKeyboard` 按 `KEY_ROWS` 与侧键渲染，支持点击选中与拖拽互换；`KeyCap` 提供立体键帽；`KeyPickerPanel`（可搜索可视化键位面板）与 `KeyPickerDialog`（拟物小键盘弹窗）提供两种交互式改键方式；`keyboardHelpers.ts` 提供 `keyAppearance`、`resolveKeycapState` 等纯函数。
+- `src/components/ui/`：shadcn/ui 组件原语；`src/index.css` 与 `tailwind.config.js` 定义浅色 + 橙色的主题 token。
+
+会话层保证多视图切换后写入行为与重构前完全一致：键位仍完整七段写回 + `0x08` 回读校验，宏写入前必须存在首次备份，逐键颜色下发前设备层强制切到 `0x13`，写入失败仍断开设备。宏读取错误同样只影响宏视图，不影响键位与灯光。
 
 ## 4. 关键数据流
 
 ### 连接与读取
 
 1. 用户主动调用 `navigator.hid.requestDevice()`。
-2. 打开匹配的 Leo87 配置接口。
+2. 打开匹配的 Lio 87 配置接口。
 3. 使用 `Begin → Current Config → 7 × 0x08 → End` 读取当前 keymap；失败时回退到 `0x07`。
 4. keymap 成功后独立使用 `0x14` 读取宏数据。
 5. 宏读取或解析失败只更新宏错误状态，连接和 keymap 保持可用；同时保留设备真实回送的样本（布局错误为 56 字节探测窗口，解析错误为整段数据）并生成诊断报告，供导出与后续分析。

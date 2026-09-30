@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import { BEGIN_FRAME, CURRENT_CONFIG_FRAME, END_FRAME, chunks, diffRecords, getPacket, lightPacket, parseGetResponse, readPacket, recordAt, replaceRecord, setPacket } from './protocol'
 
-describe('Leo87 报文', () => {
+describe('Lio 87 报文', () => {
   it('与实机灯光样例一致', () => {
     const red = lightPacket({ effectId: 0x06, brightness: 4, speed: 4, mode: 'static', color: { r: 255, g: 0, b: 0 } })
     expect(Array.from(red.slice(0, 16))).toEqual([0x3a, 0x02, 0x06, 0x27, 0, 0, 0, 0, 0x06, 0x04, 0x04, 0, 0, 0xff, 0, 0])

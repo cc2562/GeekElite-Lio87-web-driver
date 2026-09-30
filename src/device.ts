@@ -33,7 +33,7 @@ export function hidApi(): HidApi | null {
   return (navigator as Navigator & { hid?: HidApi }).hid ?? null
 }
 
-export function isLeo87(device: HidDevice): boolean {
+export function isLio87(device: HidDevice): boolean {
   return device.vendorId === VENDOR_ID && device.productId === PRODUCT_ID && device.collections.some(collection =>
     collection.usagePage === USAGE_PAGE && collection.usage === USAGE &&
     collection.inputReports.some(report => report.reportId === REPORT_ID) &&
@@ -41,21 +41,21 @@ export function isLeo87(device: HidDevice): boolean {
   )
 }
 
-export async function requestLeo87(api: HidApi): Promise<HidDevice | null> {
+export async function requestLio87(api: HidApi): Promise<HidDevice | null> {
   const devices = await api.requestDevice({ filters: [{ vendorId: VENDOR_ID, productId: PRODUCT_ID, usagePage: USAGE_PAGE, usage: USAGE }] })
-  return devices.find(isLeo87) ?? null
+  return devices.find(isLio87) ?? null
 }
 
-export async function rememberedLeo87(api: HidApi): Promise<HidDevice | null> {
-  return (await api.getDevices()).find(isLeo87) ?? null
+export async function rememberedLio87(api: HidApi): Promise<HidDevice | null> {
+  return (await api.getDevices()).find(isLio87) ?? null
 }
 
-export class Leo87Connection {
+export class Lio87Connection {
   readonly device: HidDevice
   private active = false
 
   constructor(device: HidDevice) {
-    if (!isLeo87(device)) throw new Error('设备不具备 Leo87 配置通道')
+    if (!isLio87(device)) throw new Error('设备不具备 Lio 87 配置通道')
     this.device = device
   }
 

@@ -1,6 +1,6 @@
 # Changelog
 
-本文件记录 Leo87 Studio 的主要功能变化、协议调整和已知问题。
+本文件记录 Lio 87 Studio 的主要功能变化、协议调整和已知问题。
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。当前项目尚未发布正式稳定版本。
 
@@ -49,7 +49,7 @@
 
 - 修正速度档位的方向标注：`payload[10]` 越小动画越快，界面端点由「最慢 / 最快」改为「最快 / 最慢」，并说明数字往右变大时动画变慢（此前按“越大越快”标注，与实际行为相反）。
 - `lightPacket` 的入参由 `{ color, brightness, rainbow }` 改为 `{ effectId, brightness, speed, mode, color }`，字段位置严格对应协议笔记：`payload[8] = effectId`、`[9] = brightness`、`[10] = speed`、`[12] = mode`、`[13..15] = RGB`；校验和、`payload[27] = 0xff`、`payload[36] = 0x01` 保持不变。
-- `Leo87Connection.setLighting` 在发送前做灯效白名单校验；新增 `setCustomColorMap(colorMap, lighting)`，事务为 `BEGIN → 自定义灯效 → 7 段 0x0B → END`，任一分段失败即中止且不发送结束帧。
+- `Lio87Connection.setLighting` 在发送前做灯效白名单校验；新增 `setCustomColorMap(colorMap, lighting)`，事务为 `BEGIN → 自定义灯效 → 7 段 0x0B → END`，任一分段失败即中止且不发送结束帧。
 - 修正宏存储结构的两处误读（由实机抓包闭环验证）：
   - Macro Entry 头顺序是 `<action_count:uint16> 35 00`，此前误读为 `35 00 <action_count>`，导致 entry 起点错开 2 字节；
   - Header `0x04` 是**当前序列化的 entry 数量**（1–10），不是固定值 10，offset table 长度随之等于 `entry_count × 2`。

@@ -1,4 +1,4 @@
-import { hexRecord, recordAt, type KeyRecord } from './protocol'
+import { recordAt, type KeyRecord } from './protocol'
 import { macroTriggerDescription } from './macro'
 
 export type Action = { id: string; label: string; record: KeyRecord; group: string }
@@ -73,11 +73,18 @@ export function canEdit(_keymap: Uint8Array, index: number): boolean {
   return DISPLAYED_INDICES.has(index)
 }
 
+/** 把一条 record 转成面向用户的可读动作名。 */
+export function describeRecord(record: KeyRecord): string {
+  if (record[0] === 0xa0 && record[1] === 0x40 && record[2] === 0) return '音量 +'
+  if (record[0] === 0xa0 && record[1] === 0x45 && record[2] === 0) return '音量 −'
+  return actionFor(record)?.label ?? macroTriggerDescription(record) ?? '未知动作'
+}
+
 export function recordDescription(keymap: Uint8Array, index: number): string {
   const record = recordAt(keymap, index)
   if (index === 83 && record[0] === 0xa0 && record[1] === 0x40 && record[2] === 0) return '音量 +（内置滚轮动作）'
   if (index === 84 && record[0] === 0xa0 && record[1] === 0x45 && record[2] === 0) return '音量 −（内置滚轮动作）'
-  return actionFor(record)?.label ?? macroTriggerDescription(record) ?? `未知 · ${hexRecord(record)}`
+  return describeRecord(record)
 }
 
 export function keyLabel(index: number): string {
