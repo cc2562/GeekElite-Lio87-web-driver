@@ -62,7 +62,17 @@ npm run build
 npx wrangler@latest pages deploy dist --project-name geekelite-lio87
 ```
 
-两个注意点：WebHID 需要 HTTPS（Pages 默认提供）；**不要把页面嵌进 iframe**——浏览器默认会拦掉 iframe 里的 HID 权限，连接会静默失败。
+### 如果部署成 Worker（`npx wrangler deploy`）
+
+Cloudflare 新建项目现在默认走 **Worker** 流程，部署命令是 `npx wrangler deploy`。这条路径**必须**依赖仓库根的 `wrangler.jsonc` 把 `assets` 指向构建产物：
+
+```jsonc
+"assets": { "directory": "./dist" }
+```
+
+否则 Wrangler 不知道 `dist/` 是什么，只会发布一个空的 Worker——访问任何路径都固定返回 `Hello World!`，看起来就像部署失败了。加好配置后重新构建并部署，部署日志会打印上传的文件数（正常是 4 个：`index.html`、`favicon.svg` 和 `assets/` 下的 css、js）；显示 0 个就说明 `directory` 指错了。另外 `wrangler.jsonc` 里的 `name` 要与 Cloudflare 上那个 Worker 同名，否则会另建一个新 Worker。
+
+两个注意点：WebHID 需要 HTTPS（Cloudflare 默认提供）；**不要把页面嵌进 iframe**——浏览器默认会拦掉 iframe 里的 HID 权限，连接会静默失败。
 
 ## 开发
 
