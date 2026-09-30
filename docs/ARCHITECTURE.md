@@ -155,6 +155,43 @@ hid_usage:uint8
 - entry 头为 `<action_count:uint16> 35 00`，storage 的拼装规则见第 7 节；
 - 首版不录制 Ctrl、Shift、Alt、Win、媒体键、鼠标和未知事件。
 
+### 键位解析
+
+录制时把浏览器键盘事件解析成 HID usage，入口是 `resolveKeyUsage`，按三级降级：
+
+```text
+KeyboardEvent.code（标准来源，最可靠）
+  → KeyboardEvent.keyCode（部分内嵌浏览器 / 虚拟键盘不填 code 时的旧式来源）
+  → KeyboardEvent.key（单个字母或数字，不区分大小写）
+  → 未映射
+```
+
+之所以不只依赖 `code`：只要 `code` 为空，整类按键（字母、数字）都会一起失效，而 `keyCode` / `key` 还能把它们救回来。只有三条路径都命中不了才判定未映射。
+
+`keyCode = 229` 是输入法组合输入的标志。中文输入法会截走字母键的 `keydown`（`key = 'Process'`、`keyCode = 229`、没有可用的 `code`），只把带着真实键位的 `keyup` 放行；数字键则直接透传，两件事都正常。这正是“数字能录、字母录不进去”的原因。录制中会监听 `compositionstart` 并提示切到英文输入。
+
+### 只剩抬起事件时的敲击补录
+
+当某个 `keyup` 的 usage 没有对应的按下记录时，说明环境吞掉了 `keydown`。此时按一次敲击补录两条动作（`synthesizeTapActions`）：
+
+```text
+按下：delay = 距上一条动作的间隔（最小 1 ms）
+抬起：delay = 本次不可用 keydown 到 keyup 的间隔（没有则为 0）
+```
+
+补录只保证“能录进去”，不还原真实按住时长，也不支持组合键；横幅会明确标注处于补录状态。要录到真实时序，需在英文输入法下录制。
+
+### 录制监视
+
+录制期间不存在静默忽略分支。每次按键都会更新监视条与事件历史：
+
+- `按下 / 抬起 / 记录 / 忽略` 四个计数——按下计数为 0 就说明 `keydown` 根本没到页面，而不是被规则拦下；
+- 最近一次事件的原始 `code / key / keyCode`、解析结果与解析路径；
+- 忽略原因：未映射、该键已在按下状态、已达 90 条上限；
+- 可展开的“最近 8 个键盘事件”，每行带方向、原始字段、结果与 `repeat`、`composing` 标记。
+
+这样“按键没反应”能立刻区分为三类：事件没到页面（计数不增长）、按下被输入法截走（只增长抬起、且出现补录）、收到但被规则忽略（原因可见）。
+
 ## 6. 数据保护原则
 
 - 首次写入前必须存在对应类型的浏览器备份。
@@ -209,7 +246,7 @@ used_end = 0x10 + entry_count × 2 + Σ (4 + action_count × 4)
 
 - `protocol.test.ts`：灯光、校验和、keymap 分段和 record 操作。
 - `keymap.test.ts`：键位描述、滚轮、媒体动作和宏触发显示。
-- `macro.test.ts`：实机 `entry_count = 1` 样本、10 entry 完整表、entry 头字段顺序、entry 序列化、offset 与 `used_end` 重算、槽位补建、90 条限制、触发 record，以及诊断报告。
+- `macro.test.ts`：实机 `entry_count = 1` 样本、10 entry 完整表、entry 头字段顺序、entry 序列化、offset 与 `used_end` 重算、槽位补建、90 条限制、触发 record、诊断报告，以及键位三级降级解析（含 `keyCode = 229` 的输入法场景与监视文本）。
 - `device.test.ts`：模拟 HID 设备上的读取、完整写入、ACK、超时、错位响应、写入中断、回读不一致，以及 `used_end` 越界时保留探测样本且不发送任何 `0x15`。
 
 常用验证命令：

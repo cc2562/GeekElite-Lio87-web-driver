@@ -172,6 +172,18 @@ export function parseMacroStorage(raw: Uint8Array): MacroStorage {
   return { raw: raw.slice(), usedEnd, entryCount, offsets, entries }
 }
 
+/**
+ * 环境只送来了抬起事件时（输入法把字母键的按下截成 `Process / keyCode 229`，或宿主只放行 keyup），
+ * 把一次敲击补录成「按下 + 抬起」两条动作，至少让宏可用。
+ * 这不是真实按住时长，界面会明确标注为补录。
+ */
+export function synthesizeTapActions(usage: number, pressDelayMs: number, tapDurationMs: number): MacroAction[] {
+  return [
+    { delayMs: Math.min(0xffff, Math.max(1, Math.round(pressDelayMs))), pressed: true, usage },
+    { delayMs: Math.min(0xffff, Math.max(0, Math.round(tapDurationMs))), pressed: false, usage },
+  ]
+}
+
 export function serializeMacroEntry(actions: MacroAction[]): Uint8Array {
   if (actions.length > MACRO_ACTION_LIMIT) throw new Error(`每个宏最多 ${MACRO_ACTION_LIMIT} 条动作`)
   const entry = new Uint8Array(MACRO_ENTRY_HEADER_SIZE + actions.length * MACRO_ACTION_SIZE)
@@ -232,6 +244,49 @@ for (let index = 1; index <= 12; index++) codeUsages[`F${index}`] = 0x39 + index
 
 export function usageForCode(code: string): number | null {
   return codeUsages[code] ?? null
+}
+
+// 旧式 keyCode → HID usage。只在 `code` 缺失时作为降级路径使用，值域与 codeUsages 保持一致。
+const legacyKeyCodeUsages: Record<number, number> = {}
+for (let index = 0; index < 26; index++) legacyKeyCodeUsages[65 + index] = 0x04 + index
+for (let index = 1; index <= 9; index++) legacyKeyCodeUsages[48 + index] = 0x1d + index
+legacyKeyCodeUsages[48] = 0x27
+
+export type KeySource = 'code' | 'keyCode' | 'key'
+export type KeyResolution = { usage: number | null; source: KeySource | null }
+
+/**
+ * 把浏览器键盘事件解析成 HID usage。
+ *
+ * 标准 `KeyboardEvent.code` 是最可靠的来源，但存在两个已知缺口：
+ * 1. 部分内嵌浏览器 / 虚拟键盘不填 `code`，只有旧式 `keyCode`；
+ * 2. 输入法处于组合输入时 `keyCode` 会是 229，字母键也可能拿不到 `code`。
+ * 因此按 `code` → `keyCode` → `key` 依次降级，三条路都命中不了才算未映射。
+ * 未映射不会静默丢弃，调用方会把实际收到的键显示出来。
+ */
+export function resolveKeyUsage(event: { code?: string | null; keyCode?: number | null; key?: string | null }): KeyResolution {
+  if (event.code) {
+    const mapped = usageForCode(event.code)
+    if (mapped !== null) return { usage: mapped, source: 'code' }
+  }
+  const legacy = event.keyCode === undefined || event.keyCode === null ? undefined : legacyKeyCodeUsages[event.keyCode]
+  if (legacy !== undefined) return { usage: legacy, source: 'keyCode' }
+  const key = event.key
+  if (key && key.length === 1) {
+    const upper = key.toUpperCase()
+    if (upper >= 'A' && upper <= 'Z') return { usage: 0x04 + (upper.charCodeAt(0) - 0x41), source: 'key' }
+    if (key >= '0' && key <= '9') return { usage: key === '0' ? 0x27 : 0x1d + Number(key), source: 'key' }
+  }
+  return { usage: null, source: null }
+}
+
+/** 录制监视用的单行描述：code / key / keyCode 与解析结果。 */
+export function describeKeyEvent(event: { code?: string | null; keyCode?: number | null; key?: string | null }, resolution: KeyResolution): string {
+  const raw = `${event.code || '无 code'} / ${event.key || '无 key'} / keyCode ${event.keyCode ?? '—'}`
+  if (resolution.usage === null) return `${raw} → 未映射`
+  const name = usageLabel(resolution.usage)
+  const path = resolution.source === 'code' ? '' : `（经 ${resolution.source} 降级解析）`
+  return `${raw} → ${name}${path}`
 }
 
 export function usageLabel(usage: number): string {

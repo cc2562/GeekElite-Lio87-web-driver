@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
-  MACRO_ACTION_LIMIT, MacroLayoutError, inspectMacroHeader, macroPacket, macroTriggerDescription, macroTriggerRecord,
-  macroUsedEnd, parseMacroStorage, replaceMacro, serializeMacroEntry,
+  MACRO_ACTION_LIMIT, MacroLayoutError, describeKeyEvent, inspectMacroHeader, macroPacket, macroTriggerDescription, macroTriggerRecord,
+  macroUsedEnd, parseMacroStorage, replaceMacro, resolveKeyUsage, serializeMacroEntry, synthesizeTapActions,
 } from './macro'
 
 // 实机样本：entry_count = 1，M1 只有一条「A 抬起，延后 870 ms」，used_end = 26（0x1A）。
@@ -155,5 +155,58 @@ describe('宏存储诊断', () => {
     expect(report).toContain('0x04 entry_count        LE=10')
     expect(report).toContain('offset table（0x10 起，10 × uint16 = 20 字节）')
     expect(report).toContain('0x12 → offset=0x0028')
+  })
+})
+
+describe('key resolution', () => {
+  it('优先使用 KeyboardEvent.code', () => {
+    expect(resolveKeyUsage({ code: 'KeyA' })).toEqual({ usage: 0x04, source: 'code' })
+    expect(resolveKeyUsage({ code: 'KeyZ' })).toEqual({ usage: 0x1d, source: 'code' })
+    expect(resolveKeyUsage({ code: 'Digit1' })).toEqual({ usage: 0x1e, source: 'code' })
+    expect(resolveKeyUsage({ code: 'Digit0' })).toEqual({ usage: 0x27, source: 'code' })
+  })
+
+  it('code 缺失时退到旧式 keyCode', () => {
+    expect(resolveKeyUsage({ keyCode: 65 })).toEqual({ usage: 0x04, source: 'keyCode' })
+    expect(resolveKeyUsage({ keyCode: 68 })).toEqual({ usage: 0x07, source: 'keyCode' })
+    expect(resolveKeyUsage({ keyCode: 50 })).toEqual({ usage: 0x1f, source: 'keyCode' })
+    expect(resolveKeyUsage({ keyCode: 48 })).toEqual({ usage: 0x27, source: 'keyCode' })
+  })
+
+  it('再退到 key，且不区分大小写', () => {
+    expect(resolveKeyUsage({ key: 'a' })).toEqual({ usage: 0x04, source: 'key' })
+    expect(resolveKeyUsage({ key: 'D' })).toEqual({ usage: 0x07, source: 'key' })
+    expect(resolveKeyUsage({ key: '7' })).toEqual({ usage: 0x24, source: 'key' })
+    expect(resolveKeyUsage({ key: '0' })).toEqual({ usage: 0x27, source: 'key' })
+  })
+
+  it('输入法组合输入：有 code 仍能解析，只有 keyCode=229 时不猜', () => {
+    // Chrome 在 IME 组合输入时仍会上报 code，这种字母键应当照常录入。
+    expect(resolveKeyUsage({ code: 'KeyA', keyCode: 229, key: 'Process' })).toEqual({ usage: 0x04, source: 'code' })
+    // 只有 229 和 Process 说明浏览器没有给出可靠键位，宁可报告未映射也不写入错误 usage。
+    expect(resolveKeyUsage({ keyCode: 229, key: 'Process' })).toEqual({ usage: null, source: null })
+    expect(resolveKeyUsage({})).toEqual({ usage: null, source: null })
+    expect(resolveKeyUsage({ code: 'Numpad1' })).toEqual({ usage: null, source: null })
+  })
+
+  it('监视文本同时给出原始键位与解析结果', () => {
+    expect(describeKeyEvent({ code: 'KeyA', key: 'a', keyCode: 65 }, resolveKeyUsage({ code: 'KeyA' }))).toBe('KeyA / a / keyCode 65 → A')
+    expect(describeKeyEvent({ keyCode: 65, key: 'a' }, resolveKeyUsage({ keyCode: 65 }))).toContain('经 keyCode 降级解析')
+    expect(describeKeyEvent({ code: 'Numpad1', key: 'End', keyCode: 35 }, resolveKeyUsage({ code: 'Numpad1' }))).toBe('Numpad1 / End / keyCode 35 → 未映射')
+  })
+
+  it('只剩抬起事件时补录成一次敲击', () => {
+    // 按下延时最小 1 ms（设备侧要求），敲击时长保留估算值。
+    expect(synthesizeTapActions(0x04, 0, 78)).toEqual([
+      { delayMs: 1, pressed: true, usage: 0x04 },
+      { delayMs: 78, pressed: false, usage: 0x04 },
+    ])
+    expect(synthesizeTapActions(0x05, 123.6, -5)).toEqual([
+      { delayMs: 124, pressed: true, usage: 0x05 },
+      { delayMs: 0, pressed: false, usage: 0x05 },
+    ])
+    // 补录出的两条动作必须能被序列化，且 entry 长度守恒。
+    const entry = serializeMacroEntry(synthesizeTapActions(0x04, 2, 60))
+    expect(Array.from(entry)).toEqual([2, 0, 0x35, 0, 2, 0, 0x8a, 0x04, 60, 0, 0x0a, 0x04])
   })
 })

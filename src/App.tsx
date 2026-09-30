@@ -4,8 +4,8 @@ import { hidApi, Leo87Connection, requestLeo87, type HidDevice } from './device'
 import { ACTIONS, KEY_ROWS, actionFor, canEdit, keyLabel, recordDescription } from './keymap'
 import { diffRecords, hexRecord, recordAt, replaceRecord, validateKeymap, type KeyRecord } from './protocol'
 import {
-  MACRO_ACTION_LIMIT, MACRO_COUNT, MacroLayoutError, inspectMacroHeader, macroTriggerRecord, parseMacroStorage, replaceMacro,
-  usageForCode, usageLabel, type MacroAction, type MacroStorage, type MacroTriggerMode,
+  MACRO_ACTION_LIMIT, MACRO_COUNT, MacroLayoutError, describeKeyEvent, inspectMacroHeader, macroTriggerRecord, parseMacroStorage, replaceMacro,
+  resolveKeyUsage, synthesizeTapActions, usageLabel, type MacroAction, type MacroStorage, type MacroTriggerMode,
 } from './macro'
 import { downloadMacro, downloadMacroReport, downloadRawMacro, loadMacroBackup, saveFirstMacroBackup, type MacroBackup } from './macroBackup'
 
@@ -80,6 +80,12 @@ export default function App() {
   const recordedActions = useRef<MacroAction[]>([])
   const pressedUsages = useRef<Set<number>>(new Set())
   const lastMacroEvent = useRef(0)
+  const keyCounts = useRef({ downs: 0, ups: 0, recorded: 0, ignored: 0 })
+  const lastIgnoredDown = useRef(0)
+  const [keyLog, setKeyLog] = useState<string[]>([])
+  const [keyTrace, setKeyTrace] = useState('')
+  const [imeComposing, setImeComposing] = useState(false)
+  const [tapFallback, setTapFallback] = useState(false)
 
   useEffect(() => {
     if (!api) return
@@ -122,31 +128,92 @@ export default function App() {
 
   useEffect(() => {
     if (!recording) return
+    // 录制期间收到的每个键盘事件都会写进监视条：未映射、重复按下、动作上限、缺少按下记录等原因都不再静默丢弃。
     const capture = (event: KeyboardEvent, pressed: boolean) => {
-      const usage = usageForCode(event.code)
-      if (usage === null) return
-      event.preventDefault()
-      if (pressed && (event.repeat || pressedUsages.current.has(usage))) return
-      if (!pressed && !pressedUsages.current.has(usage)) return
-      const actions = recordedActions.current
-      if (pressed && actions.length + pressedUsages.current.size + 2 > MACRO_ACTION_LIMIT) return
-      if (!pressed && actions.length >= MACRO_ACTION_LIMIT) return
       const now = performance.now()
+      const resolution = resolveKeyUsage(event)
+      const flags = `${event.repeat ? ' · repeat' : ''}${event.isComposing ? ' · composing' : ''}`
+      const base = `${describeKeyEvent(event, resolution)} · ${pressed ? '按下' : '抬起'}${flags}`
+      const log = (reason: string) => {
+        setKeyTrace(`${base} · ${reason}`)
+        setKeyLog(previous => [`${base} · ${reason}`, ...previous].slice(0, 8))
+      }
+      if (pressed) keyCounts.current.downs += 1
+      else keyCounts.current.ups += 1
+
+      const usage = resolution.usage
+      if (usage === null) {
+        // 记住这次“不可用按下”的时刻：输入法组合输入时字母键只有它会到，抬起才是真实键位。
+        if (pressed) lastIgnoredDown.current = now
+        keyCounts.current.ignored += 1
+        log('已忽略（未映射的键无法写入宏）')
+        return
+      }
+      event.preventDefault()
+      const actions = recordedActions.current
+      const held = pressedUsages.current.has(usage)
+
+      if (pressed) {
+        lastIgnoredDown.current = 0
+        if (event.repeat || held) {
+          keyCounts.current.ignored += 1
+          log('已忽略（该键已在按下状态）')
+          return
+        }
+      } else if (!held) {
+        // 按下事件没有进来（输入法截走了 keydown，只剩带真实键位的 keyup）。
+        // 补录成一次敲击，否则字母区在本环境里永远录不进去。
+        const tapStart = lastIgnoredDown.current || now
+        lastIgnoredDown.current = 0
+        if (actions.length + 2 > MACRO_ACTION_LIMIT) {
+          keyCounts.current.ignored += 1
+          log(`已忽略（已达 ${MACRO_ACTION_LIMIT} 条动作上限）`)
+          return
+        }
+        const next = [...actions, ...synthesizeTapActions(usage, now - lastMacroEvent.current, now - tapStart)]
+        lastMacroEvent.current = now
+        recordedActions.current = next
+        keyCounts.current.recorded += 2
+        setTapFallback(true)
+        log('补录为一次敲击（按下 + 抬起）')
+        setMacroDrafts(previous => new Map(previous).set(selectedMacro, next))
+        return
+      }
+
+      if (pressed && actions.length + pressedUsages.current.size + 2 > MACRO_ACTION_LIMIT) {
+        keyCounts.current.ignored += 1
+        log(`已忽略（已达 ${MACRO_ACTION_LIMIT} 条动作上限）`)
+        return
+      }
+      if (!pressed && actions.length >= MACRO_ACTION_LIMIT) {
+        keyCounts.current.ignored += 1
+        log(`已忽略（已达 ${MACRO_ACTION_LIMIT} 条动作上限）`)
+        return
+      }
       const elapsed = Math.min(0xffff, Math.max(pressed ? 1 : 0, Math.round(now - lastMacroEvent.current)))
       lastMacroEvent.current = now
       if (pressed) pressedUsages.current.add(usage)
       else pressedUsages.current.delete(usage)
       const next = [...actions, { delayMs: elapsed, pressed, usage }]
       recordedActions.current = next
+      keyCounts.current.recorded += 1
+      log('已记录')
       setMacroDrafts(previous => new Map(previous).set(selectedMacro, next))
     }
     const down = (event: KeyboardEvent) => capture(event, true)
     const up = (event: KeyboardEvent) => capture(event, false)
+    // 输入法组合输入会截走字母键，这里只用于提示，不干预录制流程。
+    const onCompositionStart = () => setImeComposing(true)
+    const onCompositionEnd = () => setImeComposing(false)
     window.addEventListener('keydown', down, true)
     window.addEventListener('keyup', up, true)
+    window.addEventListener('compositionstart', onCompositionStart, true)
+    window.addEventListener('compositionend', onCompositionEnd, true)
     return () => {
       window.removeEventListener('keydown', down, true)
       window.removeEventListener('keyup', up, true)
+      window.removeEventListener('compositionstart', onCompositionStart, true)
+      window.removeEventListener('compositionend', onCompositionEnd, true)
     }
   }, [recording, selectedMacro])
 
@@ -333,6 +400,12 @@ export default function App() {
     recordedActions.current = []
     pressedUsages.current = new Set()
     lastMacroEvent.current = performance.now()
+    keyCounts.current = { downs: 0, ups: 0, recorded: 0, ignored: 0 }
+    lastIgnoredDown.current = 0
+    setKeyLog([])
+    setKeyTrace('')
+    setImeComposing(false)
+    setTapFallback(false)
     setMacroDrafts(previous => new Map(previous).set(selectedMacro, []))
     setRecording(true)
   }
@@ -347,6 +420,15 @@ export default function App() {
     pressedUsages.current = new Set()
     setMacroDrafts(previous => new Map(previous).set(selectedMacro, next))
     setRecording(false)
+  }
+
+  // 录制中点击槽位会先停止录制（录到的动作属于原槽位），这里显式提示，避免用户以为按键失灵。
+  function selectMacroSlot(index: number) {
+    if (recording) {
+      stopMacroRecording()
+      setNotice({ type: 'info', text: `已停止录制 M${selectedMacro + 1}：动作已保留在该槽位的草稿里，切换后需要重新点击“开始录制”。` })
+    }
+    setSelectedMacro(index)
   }
 
   function updateMacroDelay(index: number, delayMs: number) {
@@ -455,10 +537,10 @@ export default function App() {
             </div>
             {macroRestore && <div className="macro-restore"><span>{macroRestore.title} · {macroRestore.bytes.length} 字节</span><div><button className="cancel-button" onClick={() => setMacroRestore(null)} disabled={Boolean(busy)}>取消</button><button className="write-button" onClick={() => void writeMacroBytes(macroRestore.bytes, '宏备份已完整恢复并通过回读校验。')} disabled={Boolean(busy) || !macroBackup || !hasDevice}>{busy === '写入宏' ? '正在恢复…' : '完整写回备份'}</button></div></div>}
             {macroStorage ? <>
-              <div className="macro-slots">{Array.from({ length: MACRO_COUNT }, (_, index) => { const entry = macroStorage.entries[index] ?? null; const actions = macroDrafts.get(index) ?? entry?.actions ?? []; return <button key={index} className={`${selectedMacro === index ? 'selected' : ''} ${macroDrafts.has(index) ? 'dirty' : ''} ${entry ? '' : 'pending-slot'}`} onClick={() => { if (recording) stopMacroRecording(); setSelectedMacro(index) }} disabled={Boolean(busy) || Boolean(macroRestore)}><strong>M{index + 1}</strong><span>{actions.length} / {MACRO_ACTION_LIMIT}</span><small>{entry ? entry.editable ? actions.length ? '键盘事件' : '空宏' : '含未知事件' : '尚未序列化'}</small></button> })}</div>
+              <div className="macro-slots">{Array.from({ length: MACRO_COUNT }, (_, index) => { const entry = macroStorage.entries[index] ?? null; const actions = macroDrafts.get(index) ?? entry?.actions ?? []; return <button key={index} className={`${selectedMacro === index ? 'selected' : ''} ${macroDrafts.has(index) ? 'dirty' : ''} ${entry ? '' : 'pending-slot'}`} onClick={() => selectMacroSlot(index)} disabled={Boolean(busy) || Boolean(macroRestore)}><strong>M{index + 1}</strong><span>{actions.length} / {MACRO_ACTION_LIMIT}</span><small>{entry ? entry.editable ? actions.length ? '键盘事件' : '空宏' : '含未知事件' : '尚未序列化'}</small></button> })}</div>
               <div className="macro-editor-panel">
                 <div className="macro-editor-head"><div><span>M{selectedMacro + 1}</span><strong>{selectedMacroActions.length} 个动作</strong><small>{!selectedMacroEntry ? macroDrafts.has(selectedMacro) ? '尚未序列化的槽位 · 有未保存更改' : '尚未序列化的槽位 · 保存后才会写入键盘' : selectedMacroEntry.editable ? macroDrafts.has(selectedMacro) ? '有未保存更改' : '与设备一致' : '包含未确认的事件编码，仅可查看原始数据'}</small></div><div className="macro-editor-actions">{recording ? <button className="record-stop" onClick={stopMacroRecording}>停止录制</button> : <button onClick={startMacroRecording} disabled={!selectedSlotEditable || Boolean(busy) || Boolean(macroRestore)}>● 开始录制</button>}<button onClick={clearMacro} disabled={!selectedSlotEditable || Boolean(busy) || Boolean(macroRestore)}>清空</button><button className="write-button" onClick={saveSelectedMacro} disabled={!selectedMacroDirty || recording || Boolean(busy) || !macroBackup || Boolean(macroRestore)}>{busy === '写入宏' ? '正在写入…' : '保存到键盘'}</button></div></div>
-                {recording && <div className="recording-banner"><i /> 正在录制 M{selectedMacro + 1}：请直接按下需要记录的普通键。修饰键、媒体键和鼠标事件不会录入。</div>}
+                {recording && <div className="recording-banner"><div><i /> 正在录制 M{selectedMacro + 1}：先点一下页面，再直接按下需要记录的普通键。修饰键、媒体键和鼠标事件不会录入。</div><div className="key-monitor"><span>按下 {keyCounts.current.downs} · 抬起 {keyCounts.current.ups} · 记录 {keyCounts.current.recorded} · 忽略 {keyCounts.current.ignored}</span><code>{keyTrace || '尚未收到键盘事件'}</code></div>{keyLog.length > 1 && <details className="key-monitor-log"><summary>最近 {keyLog.length} 个键盘事件</summary><pre>{keyLog.join('\n')}</pre></details>}{tapFallback && <div className="key-monitor-warning">字母键的“按下”事件没有到达页面（输入法会把它截成 Process / keyCode 229，只剩带着真实键位的抬起事件）。已自动按“一次敲击 = 按下 + 抬起”补录，所以字母现在能录进来了；若要保留真实的按住时长，请按 Shift 或 Ctrl+Space 切到英文输入后重新录制。</div>}{imeComposing && <div className="key-monitor-warning">检测到输入法正在组合输入：字母键会被输入法截走。请切到英文输入后重新录制。</div>}</div>}
                 <div className="macro-actions-list">{selectedMacroActions.length ? selectedMacroActions.map((action, index) => <div className="macro-action-row" key={`${index}-${action.usage}-${action.pressed}`}><span>{String(index + 1).padStart(2, '0')}</span><strong className={action.pressed ? 'down' : 'up'}>{action.pressed ? '按下' : '抬起'}</strong><b>{usageLabel(action.usage)}</b><label>延时 <input type="number" min={action.pressed ? 1 : 0} max="65535" value={action.delayMs} disabled={!selectedSlotEditable || Boolean(macroRestore)} onChange={event => updateMacroDelay(index, Math.min(65535, Math.max(action.pressed ? 1 : 0, Number(event.target.value))))} /> ms</label></div>) : <div className="macro-empty">这个槽位还没有动作。点击“开始录制”，按下并松开几个键试试。</div>}</div>
               </div>
             </> : <div className="macro-unavailable">{macroError ? '宏原始数据没有通过安全校验。原始样本与诊断报告已保留，可导出后继续分析；此状态下不会写入任何宏数据。' : '尚未读取宏数据。'}{macroDiagnostic && <details className="macro-diagnostic"><summary>查看诊断报告</summary><pre>{macroDiagnostic}</pre></details>}</div>}
