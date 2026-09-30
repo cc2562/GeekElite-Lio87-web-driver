@@ -57,9 +57,10 @@ flowchart TD
 负责板载宏的纯数据处理：
 
 - `0x14` GET 和 `0x15` SET 分段报文；
-- 宏 Header、offset table、10 个变长 entry 的解析；
+- 宏 Header（`magic / used_end / entry_count / reserved`）、长度随 `entry_count` 变化的 offset table，以及变长 entry 的解析；
 - 普通键盘宏动作的序列化；
-- 修改单个宏后重建全部 offsets 和 `used_end`；
+- 修改单个槽位后重建 `entry_count`、全部 offsets 和 `used_end`；目标槽位尚未序列化时按空 entry 补齐；
+- 布局不符时抛出 `MacroLayoutError`，携带原始探测样本，并由 `inspectMacroHeader` 生成只读诊断报告（Header 字段、offset table 与每个 entry 的 marker / action_count、hexdump）；
 - `0x70` 普通宏触发与 `0x71` 重复次数触发；
 - 浏览器 `KeyboardEvent.code` 到 USB HID usage 的有限映射。
 
@@ -85,6 +86,8 @@ flowchart TD
 
 分别保存首次成功读取的 keymap 和宏数据。备份存放于当前站点的 `localStorage`，并支持导出为二进制文件。
 
+宏模块额外提供不经过布局校验的导出：`downloadRawMacro` 保存设备真实回送的原始转储，`downloadMacroReport` 保存诊断报告文本；只有 `downloadMacro` 会对字节做完整校验。这样在布局尚未确认时也能留证据，同时不给写入路径开口子。
+
 ### `src/App.tsx`
 
 负责页面状态和工作流：
@@ -105,7 +108,7 @@ flowchart TD
 2. 打开匹配的 Leo87 配置接口。
 3. 使用 `Begin → Current Config → 7 × 0x08 → End` 读取当前 keymap；失败时回退到 `0x07`。
 4. keymap 成功后独立使用 `0x14` 读取宏数据。
-5. 宏读取或解析失败只更新宏错误状态，连接和 keymap 保持可用。
+5. 宏读取或解析失败只更新宏错误状态，连接和 keymap 保持可用；同时保留设备真实回送的样本（布局错误为 56 字节探测窗口，解析错误为整段数据）并生成诊断报告，供导出与后续分析。
 
 ### Keymap 写入
 
@@ -117,8 +120,8 @@ flowchart TD
 
 ### 宏写入
 
-1. 修改单个槽位时，其余槽位沿用原始 entry 字节。
-2. 重建 10 个 offsets 和 `used_end`。
+1. 修改单个槽位时，其余槽位沿用原始 entry 字节；已存在的 entry 不会被重新编号，也不会因为清空而删除。
+2. 目标槽位超出当前 `entry_count` 时按空 entry（`00 00 35 00`）补齐，再重建 `entry_count`、offset table 与 `used_end`。
 3. 写入前使用 `0x14` 探测目标长度范围，增长部分必须预先可读。
 4. 使用若干 `0x15` 分段写入，每段等待设备回显 ACK。
 5. 完成后重新用 `0x14` 读取并逐字节比较。
@@ -149,6 +152,7 @@ hid_usage:uint8
 - 按下延时最小为 1 ms；
 - 抬起延时可为 0 ms；
 - 每个槽位最多 90 条动作；
+- entry 头为 `<action_count:uint16> 35 00`，storage 的拼装规则见第 7 节；
 - 首版不录制 Ctrl、Shift、Alt、Win、媒体键、鼠标和未知事件。
 
 ## 6. 数据保护原则
@@ -157,30 +161,56 @@ hid_usage:uint8
 - Keymap 和宏使用互相独立的备份、导入、写入与验证流程。
 - Keymap 始终完整七段写回，不执行单段提交。
 - 宏变长 entry 必须整体重建，不在原 byte array 中直接插入数据。
-- 未知 Header、非法 offset、错误 marker、超限 action count 或未知事件会使对应宏进入只读状态。
+- 未知 Header、非法 offset、错误 marker、超限 action count、`entry_count` 越界或未知事件都会阻止对应数据的解析与写入。
 - 写入中断、超时、错位响应或回读不一致时停止当前工作流。
 - 宏写入失败后不会继续提交 keymap 触发绑定。
 
-## 7. 当前协议假设与已知差异
+## 7. 宏存储结构与约束
 
-宏解析器目前依据逆向文档采用以下布局：
+宏存储的实际布局：
 
 ```text
-0x00  AA 55          Magic
-0x02  used_end       uint16 LE
-0x04  macro_count    uint16 LE，预期为 10
-0x10  offsets[10]    uint16 LE
-0x24  entries...
+0x00  AA 55               magic
+0x02  used_end            uint16 LE，storage 结束位置
+0x04  entry_count         uint16 LE，当前序列化的 entry 数量（1–10）
+0x06  reserved            10 字节
+0x10  offsets[entry_count] uint16 LE，长度 = entry_count × 2
+entries...                每个 entry 起于对应 offset
 ```
 
-实机已出现与该布局不一致的数据：一次读取的 `used_end` 为 `0x001A`，另一次读取中 M1 offset 指向的位置没有 `35 00` marker。当前实现会拒绝解析和写入这类数据。这一保护行为是有意设计，后续需要完整保存 `0x14` 响应并补充实际 Header 布局后再扩展兼容。
+每个 entry：
+
+```text
+offset + 0x00  action_count  uint16 LE
+offset + 0x02  marker 0x0035 uint16 LE
+offset + 0x04  actions[action_count]，每条 4 字节
+entry_size = 4 + action_count × 4
+```
+
+由此得到一条闭环约束，解析时逐项校验：
+
+```text
+used_end = 0x10 + entry_count × 2 + Σ (4 + action_count × 4)
+```
+
+- `M1–M10` 是键位可绑定的槽位容量，第 i 个 entry 对应 M(i+1)；
+- storage 不保证序列化 10 个 entry，`entry_count` 由设备当前保存的内容决定；
+- 编辑器把 `index ≥ entry_count` 的槽位显示为“尚未序列化”，保存时才补建空 entry；
+- 多个 entry 的 offset 必须单调递增，第一个 offset 必须 ≥ `0x10 + entry_count × 2`；
+- 最后一个 entry 的声明长度必须正好落到 `used_end`。
+
+只要 `macroUsedEnd` 的 magic / `used_end` 范围检查失败，或 `parseMacroStorage` 的上述任一校验失败，页面就拒绝解析与写入，同时保留原始样本与诊断报告。
+
+> 历史备注：早期实现把 entry 头误读为 `35 00 <action_count>`，并把 `0x04` 当成固定值 10，
+> 导致实机 `entry_count = 1`、`used_end = 0x001A` 的正常 storage 被判为损坏。
+> 结构修正后这两个「异常」都成为合法数据的实证，详见 `docs/GeekElite_Leo87_Macro_Protocol.md` §3、§4、§8.1。
 
 ## 8. 测试结构
 
 - `protocol.test.ts`：灯光、校验和、keymap 分段和 record 操作。
 - `keymap.test.ts`：键位描述、滚轮、媒体动作和宏触发显示。
-- `macro.test.ts`：文档 M2 样本、entry 序列化、offset 重排、90 条限制和触发 record。
-- `device.test.ts`：模拟 HID 设备上的读取、完整写入、ACK、超时、错位响应、写入中断和回读不一致。
+- `macro.test.ts`：实机 `entry_count = 1` 样本、10 entry 完整表、entry 头字段顺序、entry 序列化、offset 与 `used_end` 重算、槽位补建、90 条限制、触发 record，以及诊断报告。
+- `device.test.ts`：模拟 HID 设备上的读取、完整写入、ACK、超时、错位响应、写入中断、回读不一致，以及 `used_end` 越界时保留探测样本且不发送任何 `0x15`。
 
 常用验证命令：
 

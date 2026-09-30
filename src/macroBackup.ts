@@ -34,7 +34,21 @@ export function saveFirstMacroBackup(bytes: Uint8Array): MacroBackup {
 
 export function downloadMacro(bytes: Uint8Array, name: string): void {
   validateBackupBytes(bytes)
-  const blob = new Blob([new Uint8Array(bytes)], { type: 'application/octet-stream' })
+  saveBlob(new Blob([new Uint8Array(bytes)], { type: 'application/octet-stream' }), name)
+}
+
+/**
+ * 导出未经布局校验的原始转储。用于保存设备真实回送、但当前解析器无法接受的样本。
+ */
+export function downloadRawMacro(bytes: Uint8Array, name: string): void {
+  saveBlob(new Blob([new Uint8Array(bytes)], { type: 'application/octet-stream' }), name)
+}
+
+export function downloadMacroReport(text: string, name: string): void {
+  saveBlob(new Blob([text], { type: 'text/plain;charset=utf-8' }), name)
+}
+
+function saveBlob(blob: Blob, name: string): void {
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
   link.href = url

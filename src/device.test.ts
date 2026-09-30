@@ -1,17 +1,29 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Leo87Connection, type HidDevice, type HidInputEvent } from './device'
 import { chunks, readPacket } from './protocol'
-import { macroPacket, parseMacroStorage, replaceMacro, serializeMacroEntry } from './macro'
+import { macroPacket, MacroLayoutError, MACRO_HEADER_PROBE, parseMacroStorage, replaceMacro } from './macro'
 
+// 10 个 entry 的完整表：M2 为 A 按下 + A 抬起。
 function sampleMacroStorage(): Uint8Array {
   const offsets = [0x24, 0x28, 0x34, 0x38, 0x3c, 0x40, 0x44, 0x48, 0x4c, 0x50]
   const bytes = new Uint8Array(0x54)
-  bytes.set([0xaa, 0x55, 0x54, 0, 10, 0])
+  bytes.set([0xaa, 0x55, 0x54, 0x00, 0x0a, 0x00])
   offsets.forEach((offset, index) => bytes.set([offset, 0], 0x10 + index * 2))
   offsets.forEach((offset, index) => bytes.set(index === 1
-    ? serializeMacroEntry([{ delayMs: 1, pressed: true, usage: 4 }, { delayMs: 0, pressed: false, usage: 4 }])
-    : serializeMacroEntry([]), offset))
+    ? Uint8Array.from([0x02, 0x00, 0x35, 0x00, 0x01, 0x00, 0x8a, 0x04, 0x00, 0x00, 0x0a, 0x04])
+    : Uint8Array.from([0x00, 0x00, 0x35, 0x00]), offset))
   return bytes
+}
+
+// 实机样本：entry_count = 1，M1 只有一条 A 抬起，used_end = 26（0x1A）。
+function liveMacroStorage(): Uint8Array {
+  return Uint8Array.from([
+    0xaa, 0x55, 0x1a, 0x00, 0x01, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x12, 0x00,
+    0x01, 0x00, 0x35, 0x00,
+    0x66, 0x03, 0x0a, 0x04,
+  ])
 }
 
 class FakeDevice implements HidDevice {
@@ -136,6 +148,18 @@ describe('Leo87Connection', () => {
     expect(fake.reports.map(report => [report[2], report[3], report[4]])).toEqual([[0x14, 56, 0], [0x14, 28, 56]])
   })
 
+  it('entry_count = 1 的实机样本只发一段 0x14 读取', async () => {
+    const fake = new FakeDevice()
+    fake.macroMemory.set(liveMacroStorage(), 0)
+    const result = await new Leo87Connection(fake).readMacroStorage()
+    const parsed = parseMacroStorage(result)
+    expect(result).toEqual(liveMacroStorage())
+    expect(parsed.entryCount).toBe(1)
+    expect(parsed.offsets).toEqual([0x12])
+    expect(parsed.entries[0].actions).toEqual([{ delayMs: 0x0366, pressed: false, usage: 0x04 }])
+    expect(fake.reports.map(report => [report[2], report[3], report[4]])).toEqual([[0x14, 56, 0]])
+  })
+
   it('写宏前探测范围，完整写入并回读验证', async () => {
     const fake = new FakeDevice()
     const original = parseMacroStorage(sampleMacroStorage())
@@ -164,6 +188,26 @@ describe('Leo87Connection', () => {
     const fake = new FakeDevice()
     fake.macroWrongOffset = true
     await expect(new Leo87Connection(fake).readMacroStorage()).rejects.toThrow('不匹配')
+  })
+
+  it('used_end 越界时带走原始探测样本，且不写入后可继续读取', async () => {
+    const fake = new FakeDevice()
+    fake.macroMemory.set([0xaa, 0x55, 0x0a, 0x00, 0x01, 0x00], 0)
+    const connection = new Leo87Connection(fake)
+    let caught: unknown
+    try { await connection.readMacroStorage() } catch (error) { caught = error }
+    expect(caught).toBeInstanceOf(MacroLayoutError)
+    const layoutError = caught as MacroLayoutError
+    expect(layoutError.message).toContain('used_end 无效：10')
+    expect(layoutError.header).toHaveLength(MACRO_HEADER_PROBE)
+    expect(layoutError.header.slice(0, 6)).toEqual(Uint8Array.from([0xaa, 0x55, 0x0a, 0x00, 0x01, 0x00]))
+    expect(layoutError.report).toContain('0x04 entry_count        LE=1')
+    expect(layoutError.report).toContain('offset=0x0024')
+    expect(layoutError.report).toContain('marker=35 00（命中）')
+    expect(fake.reports.map(report => report[2])).toEqual([0x14])
+    expect(fake.reports.filter(report => report[2] === 0x15)).toHaveLength(0)
+    fake.macroMemory.set(sampleMacroStorage(), 0)
+    expect(await connection.readMacroStorage()).toEqual(sampleMacroStorage())
   })
 
   it('宏读取超时后停止等待', async () => {

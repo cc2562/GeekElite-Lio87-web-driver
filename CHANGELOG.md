@@ -11,8 +11,8 @@
 - 新增板载宏协议模块：
   - `0x14` 宏数据分段读取；
   - `0x15` 宏数据分段写入与 ACK 校验；
-  - `AA 55` Magic、10 个宏槽位、offset table、entry marker 和 action count 校验；
-  - M1–M10 变长 entry 重建与 offset 重算；
+  - `AA 55` Magic、`used_end`、`entry_count`（1–10）、变长 offset table、entry marker 与 action count 校验；
+  - M1–M10 变长 entry 重建，以及 `entry_count` / offset / `used_end` 重算；
   - 每个宏最多 90 条动作。
 - 新增宏实时录制界面：
   - 记录普通键盘 keydown、keyup 和事件间隔；
@@ -25,8 +25,22 @@
   - 播放 1–255 次后停止。
 - 新增独立的宏首次读取备份、`.bin` 导入导出和恢复入口。
 - 新增宏协议、变长 entry、触发 record、设备读写中断、错位响应、超时及回读不一致测试。
+- 新增宏读取失败的诊断链路：
+  - `MacroLayoutError` 携带首次 56 字节探测样本与可复制的诊断报告；
+  - 报告按实际结构解读：`magic`、`used_end`（小端与大端读法）、`entry_count`、保留区、offset table 中每一项的 `offset / action_count / marker / entry_end`，以及 `35 00` 出现位置和 hexdump；
+  - 新增“导出原始转储”和“导出诊断报告”，未通过结构校验的样本也能保存；宏区域可展开查看报告文本。
 
 ### Changed
+
+- 修正宏存储结构的两处误读（由实机抓包闭环验证）：
+  - Macro Entry 头顺序是 `<action_count:uint16> 35 00`，此前误读为 `35 00 <action_count>`，导致 entry 起点错开 2 字节；
+  - Header `0x04` 是**当前序列化的 entry 数量**（1–10），不是固定值 10，offset table 长度随之等于 `entry_count × 2`。
+  - 结果：`entry_count = 1` 的实机 storage 现在正常解析——`offsets[0] = 0x12`（`0x10 + 1 × 2`）、`0x12 + 4 + 1 × 4 = 0x1A = used_end`；此前判定为“used_end 无效：26”的数据确认完全合法。
+  - `used_end` 下界改为“固定 Header + 1 个 offset + 1 个空 entry”，并新增闭环校验 `used_end = 0x10 + entry_count × 2 + Σ entry_size`。
+- 编辑器槽位模型跟随调整：设备未序列化的槽位显示为“尚未序列化”，可录制并在保存时补建空 entry；已有 entry 不会被重新编号，清空槽位也不会删除 entry。
+- 宏区域标题改为显示 `${usedEnd} 字节 · ${entryCount} 个 entry`。
+- 宏读取失败时不再丢弃设备已回送的数据：首次探测窗口会保留到页面供导出与诊断使用（此前失败样本会被清空，与界面“仍可导出”的提示不符）。
+- 首次 `0x14` 探测长度提取为常量 `MACRO_HEADER_PROBE`，并注明固定 Header 与 offset table 必须落在该窗口内，才能在不写设备的前提下判断结构。
 
 - 键位图会显示设备当前读取到的动作。已改键位显示新动作名称，并使用琥珀色键帽区分。
 - 修正左 Win 被错误识别为改键的问题；Win 与 Ctrl、Shift、Alt 一样识别左右修饰键别名。
@@ -37,12 +51,11 @@
 
 ### Known Issues
 
-- 当前实机的部分 `0x14` 响应与逆向文档样本不一致：
-  - 曾读取到 `used_end = 0x001A`，小于当前解析器预期的最小 Header 大小；
-  - 另一份读取数据通过 Header 初步检查后，M1 offset 所指位置不是 `35 00` marker。
-- 因此宏读取和解析目前仍属于实验功能。结构校验失败时页面不会写入宏数据，键位和灯光功能仍可使用。
-- 宏 storage Header 中保留字段、总容量和完整事务包围方式仍待更多实机抓包确认。
+- `entry_count = 0`（从未保存过任何宏的 storage）尚未在实机观察到，当前解析要求 `1 ≤ entry_count ≤ 10`；若实机出现，会以“entry 数量超出 1–10”拒绝并保留诊断报告，需再确认空 storage 的真实形态。
+- Header 的 `0x06–0x0F` 保留字段（目前抓包均为 0）、storage 总容量与完整事务包围方式仍待更多实机抓包确认。
 - Consumer Control、鼠标、修饰键组合及其他特殊宏事件尚未开放录制。
+- 向尚未序列化的槽位写入（即写入后 `entry_count` 变大）的设备行为尚未实机验证；写回仍以“写入前范围探测 + 逐字节回读”为唯一判据，不一致时拒绝并保留原数据。
+- 宏读取与写入仍属实验功能：结构校验失败时页面不会写入宏数据，键位和灯光功能不受影响。
 
 ## [0.1.0] - 2026-09-30
 

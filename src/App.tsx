@@ -4,10 +4,10 @@ import { hidApi, Leo87Connection, requestLeo87, type HidDevice } from './device'
 import { ACTIONS, KEY_ROWS, actionFor, canEdit, keyLabel, recordDescription } from './keymap'
 import { diffRecords, hexRecord, recordAt, replaceRecord, validateKeymap, type KeyRecord } from './protocol'
 import {
-  MACRO_ACTION_LIMIT, macroTriggerRecord, parseMacroStorage, replaceMacro, usageForCode, usageLabel,
-  type MacroAction, type MacroStorage, type MacroTriggerMode,
+  MACRO_ACTION_LIMIT, MACRO_COUNT, MacroLayoutError, inspectMacroHeader, macroTriggerRecord, parseMacroStorage, replaceMacro,
+  usageForCode, usageLabel, type MacroAction, type MacroStorage, type MacroTriggerMode,
 } from './macro'
-import { downloadMacro, loadMacroBackup, saveFirstMacroBackup, type MacroBackup } from './macroBackup'
+import { downloadMacro, downloadMacroReport, downloadRawMacro, loadMacroBackup, saveFirstMacroBackup, type MacroBackup } from './macroBackup'
 
 type Notice = { type: 'info' | 'success' | 'error'; text: string }
 type Restore = { bytes: Uint8Array; title: string } | null
@@ -67,6 +67,7 @@ export default function App() {
   const [macroRaw, setMacroRaw] = useState<Uint8Array | null>(null)
   const [macroStorage, setMacroStorage] = useState<MacroStorage | null>(null)
   const [macroError, setMacroError] = useState('')
+  const [macroDiagnostic, setMacroDiagnostic] = useState('')
   const [macroBackup, setMacroBackup] = useState<MacroBackup | null>(() => { try { return loadMacroBackup() } catch { return null } })
   const [macroRestore, setMacroRestore] = useState<MacroRestore>(null)
   const [selectedMacro, setSelectedMacro] = useState(0)
@@ -92,6 +93,7 @@ export default function App() {
       setMacroRaw(null)
       setMacroStorage(null)
       setMacroError('设备已断开')
+      setMacroDiagnostic('')
       setMacroDrafts(new Map())
       setRecording(false)
       setNotice({ type: 'error', text: '键盘已断开。重新连接后请先读取设备状态。' })
@@ -115,6 +117,8 @@ export default function App() {
   const selectedMacroEntry = macroStorage?.entries[selectedMacro] ?? null
   const selectedMacroActions = macroDrafts.get(selectedMacro) ?? selectedMacroEntry?.actions ?? []
   const selectedMacroDirty = macroDrafts.has(selectedMacro)
+  // 设备只序列化 entry_count 个 entry，其余槽位视为空槽：可录制，保存时才补建 entry。
+  const selectedSlotEditable = Boolean(macroStorage) && (selectedMacroEntry?.editable ?? true)
 
   useEffect(() => {
     if (!recording) return
@@ -182,6 +186,13 @@ export default function App() {
     setSelected(null)
   }
 
+  // 失败时保留设备真实回送的样本：布局错误自带 56 字节探测窗口，解析错误回退到整段数据。
+  function macroFailure(error: unknown, fallback: Uint8Array | null): { message: string; raw: Uint8Array | null; report: string } {
+    const message = error instanceof Error ? error.message : String(error)
+    if (error instanceof MacroLayoutError) return { message, raw: error.header, report: error.report }
+    return { message, raw: fallback, report: fallback && fallback.length >= 2 ? inspectMacroHeader(fallback) : '' }
+  }
+
   function acceptMacroRead(bytes: Uint8Array): string | null {
     setMacroRaw(bytes)
     setMacroDrafts(new Map())
@@ -191,22 +202,25 @@ export default function App() {
       const saved = saveFirstMacroBackup(bytes)
       setMacroBackup(saved)
     } catch (error) {
+      const failure = macroFailure(error, bytes)
       setMacroBackup(null)
-      const message = error instanceof Error ? error.message : String(error)
       setMacroStorage(null)
-      setMacroError(message)
-      return message
+      setMacroError(failure.message)
+      setMacroDiagnostic(failure.report)
+      return failure.message
     }
     try {
       const parsed = parseMacroStorage(bytes)
       setMacroStorage(parsed)
       setMacroError('')
+      setMacroDiagnostic('')
       return null
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
+      const failure = macroFailure(error, bytes)
       setMacroStorage(null)
-      setMacroError(message)
-      return message
+      setMacroError(failure.message)
+      setMacroDiagnostic(failure.report)
+      return failure.message
     }
   }
 
@@ -214,12 +228,13 @@ export default function App() {
     try {
       return acceptMacroRead(await current.readMacroStorage())
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      setMacroRaw(null)
+      const failure = macroFailure(error, null)
+      setMacroRaw(failure.raw)
       setMacroStorage(null)
-      setMacroError(message)
+      setMacroError(failure.message)
+      setMacroDiagnostic(failure.report)
       setMacroDrafts(new Map())
-      return message
+      return failure.message
     }
   }
 
@@ -314,7 +329,7 @@ export default function App() {
   }
 
   function startMacroRecording() {
-    if (!selectedMacroEntry?.editable || macroRestore) return
+    if (!selectedSlotEditable || macroRestore) return
     recordedActions.current = []
     pressedUsages.current = new Set()
     lastMacroEvent.current = performance.now()
@@ -435,18 +450,18 @@ export default function App() {
           <div className="data-heading"><div><span className="section-number">02 / ONBOARD MACRO</span><h2>把一串动作，<span>交给一个键。</span></h2></div><p>实时录制普通键盘事件，保存到 M1–M10，再从键位配置中绑定触发方式。</p></div>
           <div className="macro-panel">
             <div className="macro-toolbar">
-              <div><strong>板载宏存储</strong><small>{macroStorage ? `已读取 ${macroStorage.usedEnd} 字节` : macroError ? `读取或解析失败 · ${macroError}` : '连接设备后自动读取'}</small></div>
-              <div className="data-actions macro-data-actions"><button onClick={() => macroRaw && downloadMacro(macroRaw, 'leo87-current-macros.bin')} disabled={!macroRaw || Boolean(busy)}>导出当前宏</button><button onClick={() => macroBackup && downloadMacro(macroBackup.bytes, 'leo87-first-macro-backup.bin')} disabled={!macroBackup || Boolean(busy)}>导出首次备份</button><button onClick={() => { if (macroBackup) { try { parseMacroStorage(macroBackup.bytes); setMacroRestore({ bytes: macroBackup.bytes, title: '浏览器首次宏备份' }); setMacroDrafts(new Map()) } catch (error) { setNotice({ type: 'error', text: error instanceof Error ? error.message : String(error) }) } } }} disabled={!macroBackup || Boolean(busy)}>载入首次备份</button><button onClick={() => macroFileInput.current?.click()} disabled={!hasDevice || Boolean(busy)}>导入 .bin</button><input ref={macroFileInput} type="file" accept=".bin,application/octet-stream" hidden onChange={event => { const file = event.target.files?.[0]; if (file) void importMacroFile(file) }} /></div>
+              <div><strong>板载宏存储</strong><small>{macroStorage ? `已读取 ${macroStorage.usedEnd} 字节 · ${macroStorage.entryCount} 个 entry` : macroError ? `读取或解析失败 · ${macroError}` : '连接设备后自动读取'}</small></div>
+              <div className="data-actions macro-data-actions"><button onClick={() => macroRaw && downloadRawMacro(macroRaw, macroError ? 'leo87-macro-dump.bin' : 'leo87-current-macros.bin')} disabled={!macroRaw || Boolean(busy)}>{macroError ? '导出原始转储' : '导出当前宏'}</button><button onClick={() => macroDiagnostic && downloadMacroReport(macroDiagnostic, 'leo87-macro-diagnostic.txt')} disabled={!macroDiagnostic || Boolean(busy)}>导出诊断报告</button><button onClick={() => macroBackup && downloadMacro(macroBackup.bytes, 'leo87-first-macro-backup.bin')} disabled={!macroBackup || Boolean(busy)}>导出首次备份</button><button onClick={() => { if (macroBackup) { try { parseMacroStorage(macroBackup.bytes); setMacroRestore({ bytes: macroBackup.bytes, title: '浏览器首次宏备份' }); setMacroDrafts(new Map()) } catch (error) { setNotice({ type: 'error', text: error instanceof Error ? error.message : String(error) }) } } }} disabled={!macroBackup || Boolean(busy)}>载入首次备份</button><button onClick={() => macroFileInput.current?.click()} disabled={!hasDevice || Boolean(busy)}>导入 .bin</button><input ref={macroFileInput} type="file" accept=".bin,application/octet-stream" hidden onChange={event => { const file = event.target.files?.[0]; if (file) void importMacroFile(file) }} /></div>
             </div>
             {macroRestore && <div className="macro-restore"><span>{macroRestore.title} · {macroRestore.bytes.length} 字节</span><div><button className="cancel-button" onClick={() => setMacroRestore(null)} disabled={Boolean(busy)}>取消</button><button className="write-button" onClick={() => void writeMacroBytes(macroRestore.bytes, '宏备份已完整恢复并通过回读校验。')} disabled={Boolean(busy) || !macroBackup || !hasDevice}>{busy === '写入宏' ? '正在恢复…' : '完整写回备份'}</button></div></div>}
             {macroStorage ? <>
-              <div className="macro-slots">{macroStorage.entries.map((entry, index) => { const actions = macroDrafts.get(index) ?? entry.actions; return <button key={index} className={`${selectedMacro === index ? 'selected' : ''} ${macroDrafts.has(index) ? 'dirty' : ''}`} onClick={() => { if (recording) stopMacroRecording(); setSelectedMacro(index) }} disabled={Boolean(busy) || Boolean(macroRestore)}><strong>M{index + 1}</strong><span>{actions.length} / {MACRO_ACTION_LIMIT}</span><small>{entry.editable ? actions.length ? '键盘事件' : '空宏' : '含未知事件'}</small></button> })}</div>
+              <div className="macro-slots">{Array.from({ length: MACRO_COUNT }, (_, index) => { const entry = macroStorage.entries[index] ?? null; const actions = macroDrafts.get(index) ?? entry?.actions ?? []; return <button key={index} className={`${selectedMacro === index ? 'selected' : ''} ${macroDrafts.has(index) ? 'dirty' : ''} ${entry ? '' : 'pending-slot'}`} onClick={() => { if (recording) stopMacroRecording(); setSelectedMacro(index) }} disabled={Boolean(busy) || Boolean(macroRestore)}><strong>M{index + 1}</strong><span>{actions.length} / {MACRO_ACTION_LIMIT}</span><small>{entry ? entry.editable ? actions.length ? '键盘事件' : '空宏' : '含未知事件' : '尚未序列化'}</small></button> })}</div>
               <div className="macro-editor-panel">
-                <div className="macro-editor-head"><div><span>M{selectedMacro + 1}</span><strong>{selectedMacroActions.length} 个动作</strong><small>{selectedMacroEntry?.editable ? selectedMacroDirty ? '有未保存更改' : '与设备一致' : '包含未确认的事件编码，仅可查看原始数据'}</small></div><div className="macro-editor-actions">{recording ? <button className="record-stop" onClick={stopMacroRecording}>停止录制</button> : <button onClick={startMacroRecording} disabled={!selectedMacroEntry?.editable || Boolean(busy) || Boolean(macroRestore)}>● 开始录制</button>}<button onClick={clearMacro} disabled={!selectedMacroEntry?.editable || Boolean(busy) || Boolean(macroRestore)}>清空</button><button className="write-button" onClick={saveSelectedMacro} disabled={!selectedMacroDirty || recording || Boolean(busy) || !macroBackup || Boolean(macroRestore)}>{busy === '写入宏' ? '正在写入…' : '保存到键盘'}</button></div></div>
+                <div className="macro-editor-head"><div><span>M{selectedMacro + 1}</span><strong>{selectedMacroActions.length} 个动作</strong><small>{!selectedMacroEntry ? macroDrafts.has(selectedMacro) ? '尚未序列化的槽位 · 有未保存更改' : '尚未序列化的槽位 · 保存后才会写入键盘' : selectedMacroEntry.editable ? macroDrafts.has(selectedMacro) ? '有未保存更改' : '与设备一致' : '包含未确认的事件编码，仅可查看原始数据'}</small></div><div className="macro-editor-actions">{recording ? <button className="record-stop" onClick={stopMacroRecording}>停止录制</button> : <button onClick={startMacroRecording} disabled={!selectedSlotEditable || Boolean(busy) || Boolean(macroRestore)}>● 开始录制</button>}<button onClick={clearMacro} disabled={!selectedSlotEditable || Boolean(busy) || Boolean(macroRestore)}>清空</button><button className="write-button" onClick={saveSelectedMacro} disabled={!selectedMacroDirty || recording || Boolean(busy) || !macroBackup || Boolean(macroRestore)}>{busy === '写入宏' ? '正在写入…' : '保存到键盘'}</button></div></div>
                 {recording && <div className="recording-banner"><i /> 正在录制 M{selectedMacro + 1}：请直接按下需要记录的普通键。修饰键、媒体键和鼠标事件不会录入。</div>}
-                <div className="macro-actions-list">{selectedMacroActions.length ? selectedMacroActions.map((action, index) => <div className="macro-action-row" key={`${index}-${action.usage}-${action.pressed}`}><span>{String(index + 1).padStart(2, '0')}</span><strong className={action.pressed ? 'down' : 'up'}>{action.pressed ? '按下' : '抬起'}</strong><b>{usageLabel(action.usage)}</b><label>延时 <input type="number" min={action.pressed ? 1 : 0} max="65535" value={action.delayMs} disabled={!selectedMacroEntry?.editable || Boolean(macroRestore)} onChange={event => updateMacroDelay(index, Math.min(65535, Math.max(action.pressed ? 1 : 0, Number(event.target.value))))} /> ms</label></div>) : <div className="macro-empty">这个槽位还没有动作。点击“开始录制”，按下并松开几个键试试。</div>}</div>
+                <div className="macro-actions-list">{selectedMacroActions.length ? selectedMacroActions.map((action, index) => <div className="macro-action-row" key={`${index}-${action.usage}-${action.pressed}`}><span>{String(index + 1).padStart(2, '0')}</span><strong className={action.pressed ? 'down' : 'up'}>{action.pressed ? '按下' : '抬起'}</strong><b>{usageLabel(action.usage)}</b><label>延时 <input type="number" min={action.pressed ? 1 : 0} max="65535" value={action.delayMs} disabled={!selectedSlotEditable || Boolean(macroRestore)} onChange={event => updateMacroDelay(index, Math.min(65535, Math.max(action.pressed ? 1 : 0, Number(event.target.value))))} /> ms</label></div>) : <div className="macro-empty">这个槽位还没有动作。点击“开始录制”，按下并松开几个键试试。</div>}</div>
               </div>
-            </> : <div className="macro-unavailable">{macroError ? '宏原始数据没有通过安全校验。你仍可导出当前数据用于继续分析。' : '尚未读取宏数据。'}</div>}
+            </> : <div className="macro-unavailable">{macroError ? '宏原始数据没有通过安全校验。原始样本与诊断报告已保留，可导出后继续分析；此状态下不会写入任何宏数据。' : '尚未读取宏数据。'}{macroDiagnostic && <details className="macro-diagnostic"><summary>查看诊断报告</summary><pre>{macroDiagnostic}</pre></details>}</div>}
           </div>
         </section>
 

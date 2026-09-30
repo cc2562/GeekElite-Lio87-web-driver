@@ -3,7 +3,7 @@ import {
   chunks, lightPacket, parseReadResponse, readPacket, setPacket, validateKeymap, type Lighting,
 } from './protocol'
 import {
-  MACRO_GET, MACRO_SET, macroChunks, macroPacket, macroUsedEnd, parseMacroResponse, parseMacroStorage,
+  MACRO_GET, MACRO_HEADER_PROBE, MACRO_SET, macroChunks, macroPacket, macroUsedEnd, parseMacroResponse, parseMacroStorage,
 } from './macro'
 
 export type HidInputEvent = { reportId: number; data: DataView }
@@ -137,7 +137,9 @@ export class Leo87Connection {
   }
 
   private async readMacroStorageUnlocked(): Promise<Uint8Array> {
-    const first = await this.receiveMacro(MACRO_GET, 0, 56)
+    // 首次探测只取 Header 窗口。此处的解析失败会带上原始样本（MacroLayoutError.header），
+    // 供页面导出与诊断使用，不在此处丢弃。
+    const first = await this.receiveMacro(MACRO_GET, 0, MACRO_HEADER_PROBE)
     const usedEnd = macroUsedEnd(first)
     const bytes = new Uint8Array(usedEnd)
     bytes.set(first.slice(0, Math.min(first.length, usedEnd)))
