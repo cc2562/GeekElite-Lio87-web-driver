@@ -35,6 +35,7 @@ class FakeDevice implements HidDevice {
   reports: Uint8Array[] = []
   memory = Uint8Array.from({ length: 384 }, (_, i) => i & 0xff)
   failAtSet = -1
+  failAtReport = -1
   wrongOffset = false
   acknowledgeWrites = false
   staleGet = false
@@ -52,6 +53,7 @@ class FakeDevice implements HidDevice {
   async sendReport(reportId: number, data: Uint8Array) {
     expect(reportId).toBe(4)
     this.reports.push(data.slice())
+    if (this.failAtReport >= 0 && this.reports.length === this.failAtReport) throw new Error('模拟发送中断')
     const command = data[2]
     if (command === 9) {
       if (this.reports.filter(item => item[2] === 9).length === this.failAtSet) throw new Error('模拟写入中断')
@@ -139,6 +141,41 @@ describe('Leo87Connection', () => {
     expect(result.readback).toBeNull()
     expect(result.readError).toContain('不匹配')
     expect(fake.reports.some(report => report[2] === 2)).toBe(true)
+  })
+
+  it('逐键颜色按完整事务写入：BEGIN → 自定义灯效 → 7 段 0x0B → END', async () => {
+    const fake = new FakeDevice()
+    const map = new Uint8Array(384)
+    // record 63 → 颜色表偏移 189（0xBD），落在 0x00A8 这一分段里。
+    map.set([0, 215, 15], 63 * 3)
+    await new Leo87Connection(fake).setCustomColorMap(map, { effectId: 0x05, brightness: 4, speed: 1, mode: 'cycle', color: { r: 255, g: 0, b: 0 } })
+
+    expect(fake.reports.map(report => report[2])).toEqual([1, 6, ...Array(7).fill(0x0b), 2])
+    const lighting = fake.reports[1]
+    // 逐键颜色必须先启用自定义灯效，因此 effectId 被强制为 0x13。
+    expect(lighting[8]).toBe(0x13)
+    expect([lighting[9], lighting[10], lighting[12]]).toEqual([4, 1, 1])
+    expect(lighting[13]).toBe(0xff)
+    expect(fake.reports.filter(report => report[2] === 0x0b).map(report => [report[4] | report[5] << 8, report[3]]))
+      .toEqual(chunks().map(chunk => [chunk.offset, chunk.length]))
+
+    const holder = fake.reports.find(report => report[2] === 0x0b && (report[4] | report[5] << 8) === 0x00a8)!
+    const at = 63 * 3 - 0x00a8
+    expect([holder[7 + at], holder[7 + at + 1], holder[7 + at + 2]]).toEqual([0, 215, 15])
+    // 不夹杂改键或宏命令。
+    expect(fake.reports.some(report => report[2] === 9 || report[2] === 0x14 || report[2] === 0x15)).toBe(false)
+  })
+
+  it('逐键颜色长度非法时不发报文；中途失败时不发送结束帧', async () => {
+    const fake = new FakeDevice()
+    const connection = new Leo87Connection(fake)
+    const lighting = { effectId: 0x06, brightness: 4, speed: 1, mode: 'static' as const, color: { r: 0, g: 0, b: 0 } }
+    await expect(connection.setCustomColorMap(new Uint8Array(383), lighting)).rejects.toThrow('384 字节')
+    expect(fake.reports).toHaveLength(0)
+
+    fake.failAtReport = 4
+    await expect(connection.setCustomColorMap(new Uint8Array(384), lighting)).rejects.toThrow('模拟发送中断')
+    expect(fake.reports.map(report => report[2])).toEqual([1, 6, 0x0b, 0x0b])
   })
 
   it('按 used_end 分段读取完整宏存储', async () => {

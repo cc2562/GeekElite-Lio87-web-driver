@@ -9,8 +9,20 @@ export const RECORD_SIZE = 3
 export const CHUNK_SIZE = 56
 
 export type Rgb = { r: number; g: number; b: number }
-export type Lighting = { color: Rgb; brightness: number; rainbow: boolean }
+export type LightingMode = 'static' | 'cycle'
+export type Lighting = {
+  effectId: number
+  brightness: number
+  speed: number
+  mode: LightingMode
+  color: Rgb
+}
 export type KeyRecord = readonly [number, number, number]
+
+// 灯光子命令：payload[8..15] 的字段位置见 docs/GeekElite_Leo87_Lighting_Protocol.md §3。
+export const LIGHT_COMMAND = 0x06
+export const LIGHT_SUBCOMMAND = 0x27
+export const LIGHT_RANGE_MAX = 4
 
 export const BEGIN_FRAME = frame(0x01)
 export const END_FRAME = frame(0x02)
@@ -43,16 +55,19 @@ function byte(value: number, name: string): number {
   return value
 }
 
-export function lightPacket({ color, brightness, rainbow }: Lighting): Uint8Array {
-  if (!Number.isInteger(brightness) || brightness < 0 || brightness > 4) throw new Error('亮度必须在 0–4 之间')
+export function lightPacket({ effectId, brightness, speed, mode, color }: Lighting): Uint8Array {
+  if (!Number.isInteger(brightness) || brightness < 0 || brightness > LIGHT_RANGE_MAX) throw new Error(`亮度必须在 0–${LIGHT_RANGE_MAX} 之间`)
+  // payload[10] 是速度档位，实机观察数值越小动画越快（0 最快、4 最慢），与字段范围 0–4 一致。
+  if (!Number.isInteger(speed) || speed < 0 || speed > LIGHT_RANGE_MAX) throw new Error(`速度必须在 0–${LIGHT_RANGE_MAX} 之间`)
+  if (!Number.isInteger(effectId) || effectId < 0 || effectId > 0xff) throw new Error('灯效 ID 超出字节范围')
   const packet = new Uint8Array(PAYLOAD_SIZE)
-  // 来自 docs/j键位结果.txt 中经过实机验证的静态红色样例。
-  packet[2] = 0x06
-  packet[3] = 0x27
-  packet[8] = 0x06
+  // 校验和、payload[27] 与 payload[36] 沿用 docs/j键位结果.txt 中经过实机验证的样例。
+  packet[2] = LIGHT_COMMAND
+  packet[3] = LIGHT_SUBCOMMAND
+  packet[8] = effectId
   packet[9] = brightness
-  packet[10] = 0x04
-  packet[12] = rainbow ? 1 : 0
+  packet[10] = speed
+  packet[12] = mode === 'cycle' ? 1 : 0
   packet[13] = byte(color.r, '红色')
   packet[14] = byte(color.g, '绿色')
   packet[15] = byte(color.b, '蓝色')

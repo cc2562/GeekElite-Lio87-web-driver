@@ -4,13 +4,25 @@ import { BEGIN_FRAME, CURRENT_CONFIG_FRAME, END_FRAME, chunks, diffRecords, getP
 
 describe('Leo87 报文', () => {
   it('与实机灯光样例一致', () => {
-    const red = lightPacket({ color: { r: 255, g: 0, b: 0 }, brightness: 4, rainbow: false })
+    const red = lightPacket({ effectId: 0x06, brightness: 4, speed: 4, mode: 'static', color: { r: 255, g: 0, b: 0 } })
     expect(Array.from(red.slice(0, 16))).toEqual([0x3a, 0x02, 0x06, 0x27, 0, 0, 0, 0, 0x06, 0x04, 0x04, 0, 0, 0xff, 0, 0])
     expect(red[27]).toBe(0xff)
     expect(red[36]).toBe(1)
-    expect(Array.from(lightPacket({ color: { r: 123, g: 45, b: 67 }, brightness: 4, rainbow: false }).slice(0, 2))).toEqual([0x26, 0x02])
+    expect(Array.from(lightPacket({ effectId: 0x06, brightness: 4, speed: 4, mode: 'static', color: { r: 123, g: 45, b: 67 } }).slice(0, 2))).toEqual([0x26, 0x02])
     expect(Array.from(BEGIN_FRAME.slice(0, 3))).toEqual([1, 0, 1])
     expect(Array.from(END_FRAME.slice(0, 3))).toEqual([2, 0, 2])
+  })
+
+  it('灯效、亮度与速度按参数落到 payload[8..12]，越界被拒绝', () => {
+    const wave = lightPacket({ effectId: 0x01, brightness: 0, speed: 1, mode: 'cycle', color: { r: 0, g: 0, b: 0 } })
+    expect(wave[8]).toBe(0x01)
+    expect(wave[9]).toBe(0)
+    expect(wave[10]).toBe(1)
+    expect(wave[12]).toBe(1)
+    const baseline = { effectId: 0x06, brightness: 0, speed: 0, mode: 'static' as const, color: { r: 0, g: 0, b: 0 } }
+    expect(() => lightPacket({ ...baseline, brightness: 5 })).toThrow('亮度')
+    expect(() => lightPacket({ ...baseline, speed: -1 })).toThrow('速度')
+    expect(() => lightPacket({ ...baseline, effectId: 0x100 })).toThrow('灯效')
   })
 
   it('七段请求与笔记吻合，末段只有 48 字节', () => {

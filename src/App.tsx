@@ -2,16 +2,22 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { downloadKeymap, loadBackup, saveFirstBackup, type Backup } from './backup'
 import { hidApi, Leo87Connection, requestLeo87, type HidDevice } from './device'
 import { ACTIONS, KEY_ROWS, actionFor, canEdit, keyLabel, recordDescription } from './keymap'
-import { diffRecords, hexRecord, recordAt, replaceRecord, validateKeymap, type KeyRecord } from './protocol'
+import { diffRecords, hexRecord, recordAt, replaceRecord, validateKeymap, type KeyRecord, type LightingMode } from './protocol'
 import {
   MACRO_ACTION_LIMIT, MACRO_COUNT, MacroLayoutError, describeKeyEvent, inspectMacroHeader, macroTriggerRecord, parseMacroStorage, replaceMacro,
   resolveKeyUsage, synthesizeTapActions, usageLabel, type MacroAction, type MacroStorage, type MacroTriggerMode,
 } from './macro'
 import { downloadMacro, downloadMacroReport, downloadRawMacro, loadMacroBackup, saveFirstMacroBackup, type MacroBackup } from './macroBackup'
+import { downloadColorMap, importColorMapFile, loadColorMap, saveColorMap, type ColorMapBackup } from './colorMapBackup'
+import {
+  CUSTOM_EFFECT_ID, DEFAULT_EFFECT_ID, DEFAULT_SPEED, EFFECT_OPTIONS, PRESET_COLORS, clearColorMap, clearRecordColor, colorAt,
+  coloredRecordCount, createColorMap, diffColorMap, effectLabel, hexColor, parseHexColor, withRecordColor,
+} from './lighting'
 
 type Notice = { type: 'info' | 'success' | 'error'; text: string }
 type Restore = { bytes: Uint8Array; title: string } | null
 type MacroRestore = { bytes: Uint8Array; title: string } | null
+type KeyMode = 'remap' | 'color'
 const groups = [...new Set(ACTIONS.map(action => action.group))]
 const sideControls = [
   { index: 83, icon: '↟', label: '滚轮上' },
@@ -20,8 +26,12 @@ const sideControls = [
   { index: 87, icon: '▶▶', label: '下一曲' },
 ]
 
-function parseColor(hex: string): { r: number; g: number; b: number } {
-  return { r: parseInt(hex.slice(1, 3), 16), g: parseInt(hex.slice(3, 5), 16), b: parseInt(hex.slice(5, 7), 16) }
+function effectHex(id: number): string {
+  return `0x${id.toString(16).padStart(2, '0').toUpperCase()}`
+}
+
+function isUncolored(color: { r: number; g: number; b: number }): boolean {
+  return color.r === 0 && color.g === 0 && color.b === 0
 }
 
 function formatDate(iso: string): string {
@@ -61,9 +71,17 @@ export default function App() {
   const [notice, setNotice] = useState<Notice>({ type: 'info', text: '连接键盘后，先读取完整键位表，再开始配置。' })
   const [color, setColor] = useState('#63e6be')
   const [brightness, setBrightness] = useState(4)
-  const [rainbow, setRainbow] = useState(false)
+  const [speed, setSpeed] = useState(DEFAULT_SPEED)
+  const [effectId, setEffectId] = useState(DEFAULT_EFFECT_ID)
+  const [colorMode, setColorMode] = useState<LightingMode>('static')
   const [showRecords, setShowRecords] = useState(false)
+  // 逐键颜色表：设备没有对应的读取命令，因此本地工作表就是唯一记录，导出与导入都基于它。
+  const [colorMapBackup, setColorMapBackup] = useState<ColorMapBackup | null>(() => { try { return loadColorMap() } catch { return null } })
+  const [colorMap, setColorMap] = useState<Uint8Array>(() => colorMapBackup?.bytes ?? createColorMap())
+  const [sentColorMap, setSentColorMap] = useState<Uint8Array>(() => colorMapBackup?.bytes ?? createColorMap())
+  const [keyMode, setKeyMode] = useState<KeyMode>('remap')
   const fileInput = useRef<HTMLInputElement | null>(null)
+  const colorFileInput = useRef<HTMLInputElement | null>(null)
   const [macroRaw, setMacroRaw] = useState<Uint8Array | null>(null)
   const [macroStorage, setMacroStorage] = useState<MacroStorage | null>(null)
   const [macroError, setMacroError] = useState('')
@@ -125,6 +143,18 @@ export default function App() {
   const selectedMacroDirty = macroDrafts.has(selectedMacro)
   // 设备只序列化 entry_count 个 entry，其余槽位视为空槽：可录制，保存时才补建 entry。
   const selectedSlotEditable = Boolean(macroStorage) && (selectedMacroEntry?.editable ?? true)
+  // 逐键颜色：草稿与「上次已发送」之间的差异就是待写入量，没有差异时禁止重复提交。
+  const colorDifferences = useMemo(() => diffColorMap(sentColorMap, colorMap), [sentColorMap, colorMap])
+  const coloredCount = useMemo(() => coloredRecordCount(colorMap), [colorMap])
+  const selectedColor = selected !== null ? colorAt(colorMap, selected) : null
+
+  // 逐键颜色模式下用键帽底色呈现该 record 的颜色；未设置颜色的键保持默认外观。
+  function paintFor(index: number): { className: string; style?: React.CSSProperties } {
+    if (keyMode !== 'color') return { className: '' }
+    const value = colorAt(colorMap, index)
+    if (isUncolored(value)) return { className: '' }
+    return { className: 'colored', style: { '--key-color': hexColor(value) } as React.CSSProperties }
+  }
 
   useEffect(() => {
     if (!recording) return
@@ -365,9 +395,52 @@ export default function App() {
   function applyLighting() {
     if (!connection.current || !keymap) return
     void operate('应用灯光', async () => {
-      await connection.current!.setLighting({ color: parseColor(color), brightness, rainbow })
-      setNotice({ type: 'success', text: '灯光指令已发送。请观察键盘确认效果。' })
+      await connection.current!.setLighting({ effectId, brightness, speed, mode: colorMode, color: parseHexColor(color) })
+      setNotice({ type: 'success', text: `已发送灯效「${effectLabel(effectId)}」（${effectHex(effectId)}）· 亮度 ${brightness} · 速度 ${speed}。发送成功仅代表报文已发出，请观察键盘确认效果。` })
     }, true)
+  }
+
+  // 逐键颜色的编辑只改本地草稿；只有“应用到键盘”才会写设备并更新本地工作表。
+  function applyKeyColor(hex: string) {
+    if (selected === null) return
+    try {
+      setColorMap(withRecordColor(colorMap, selected, parseHexColor(hex)))
+    } catch (error) {
+      setNotice({ type: 'error', text: error instanceof Error ? error.message : String(error) })
+    }
+  }
+
+  function clearSelectedKeyColor() {
+    if (selected === null) return
+    setColorMap(clearRecordColor(colorMap, selected))
+  }
+
+  function clearAllKeyColors() {
+    setColorMap(clearColorMap(colorMap))
+  }
+
+  function applyCustomColorMap() {
+    if (!connection.current || !keymap || colorDifferences.length === 0) return
+    const next = colorMap
+    const changed = colorDifferences.length
+    void operate('应用逐键颜色', async () => {
+      await connection.current!.setCustomColorMap(next, { effectId: CUSTOM_EFFECT_ID, brightness, speed, mode: colorMode, color: parseHexColor(color) })
+      setSentColorMap(next)
+      // 本地工作表写入失败与已发出的报文无关，单独兜底，不影响设备状态。
+      try { setColorMapBackup(saveColorMap(next)) } catch { setColorMapBackup(null) }
+      setNotice({ type: 'success', text: `已切换到自定义灯效并完整写入 128 条颜色记录（${changed} 个键有改动）。设备没有颜色表回读命令，请观察键盘确认效果。` })
+    }, true)
+  }
+
+  async function importColorMap(file: File) {
+    try {
+      const bytes = new Uint8Array(await file.arrayBuffer())
+      setColorMap(importColorMapFile(bytes))
+      setNotice({ type: 'info', text: '已载入逐键颜色表。检查差异后点击“应用到键盘”完整写入。' })
+    } catch (error) {
+      setNotice({ type: 'error', text: error instanceof Error ? error.message : String(error) })
+    }
+    if (colorFileInput.current) colorFileInput.current.value = ''
   }
 
   function stageAction(actionId: string) {
@@ -523,9 +596,53 @@ export default function App() {
         <section className="workspace-heading"><div><span className="section-number">01 / CONTROL CENTER</span><h2>你的键盘，<span>你的设置。</span></h2></div><div className="workspace-tools">{hasDevice && <><button className="text-button" onClick={reread} disabled={Boolean(busy)}>↻ 重新读取</button><button className="text-button" onClick={disconnect} disabled={Boolean(busy)}>断开连接 ↗</button></>}</div></section>
 
         <div className="panel-grid">
-          <section className="panel lighting-panel"><div className="panel-top"><div className="panel-icon light-icon">✳</div><span className="panel-counter">01 — LIGHTING</span></div><h3>灯光控制</h3><p className="panel-description">选一种颜色，让桌面拥有自己的氛围。</p><div className="lighting-preview" style={{ '--light-color': color } as React.CSSProperties}><div className="preview-glow" /><div className="preview-inner"><span>LEO<span>87</span></span><small>{rainbow ? 'RGB CYCLE' : 'STATIC COLOR'}</small></div></div><div className="field-line"><label htmlFor="color">灯光颜色</label><div className="color-field"><input id="color" type="color" value={color} onChange={event => setColor(event.target.value)} disabled={Boolean(busy)} /><span>{color.toUpperCase()}</span></div></div><div className="field-block"><div className="field-heading"><label htmlFor="brightness">亮度等级</label><strong>{brightness} <span>/ 4</span></strong></div><input id="brightness" className="brightness-range" type="range" min="0" max="4" step="1" value={brightness} onChange={event => setBrightness(Number(event.target.value))} disabled={Boolean(busy)} /><div className="range-labels"><span>关闭</span><span>最亮</span></div></div><label className="toggle-line"><span><strong>RGB 轮换</strong><small>自动变换颜色</small></span><input type="checkbox" checked={rainbow} onChange={event => setRainbow(event.target.checked)} disabled={Boolean(busy)} /><span className="toggle-switch" /></label><button className="panel-button" onClick={applyLighting} disabled={!hasDevice || Boolean(busy)}>应用灯光设置 <span>→</span></button></section>
+          <section className="panel lighting-panel">
+            <div className="panel-top"><div className="panel-icon light-icon">✳</div><span className="panel-counter">01 — LIGHTING</span></div>
+            <h3>灯光与动画</h3>
+            <p className="panel-description">从实机抓包确认过的灯效里挑一个，再微调亮度、速度与颜色。</p>
+            <div className="lighting-preview" style={{ '--light-color': color } as React.CSSProperties}>
+              <div className="preview-glow" />
+              <div className="preview-inner"><span>LEO<span>87</span></span><small>{effectLabel(effectId)} · {colorMode === 'cycle' ? 'RGB 轮换' : '静态色'}</small></div>
+            </div>
+            <div className="effect-field">
+              <div className="field-heading"><span>灯效</span><strong>{effectLabel(effectId)} <span>{effectHex(effectId)}</span></strong></div>
+              <div className="effect-grid">{EFFECT_OPTIONS.map(effect => <button key={effect.id} className={`effect-chip ${effectId === effect.id ? 'selected' : ''}`} onClick={() => setEffectId(effect.id)} disabled={Boolean(busy)} title={`${effectHex(effect.id)} · ${effect.label}`}>{effect.label}</button>)}</div>
+              <p className="field-note">只列出实机确认过的灯效；尚未抓到的 0x11 不会出现在这里，也不会下发。</p>
+              <div className="field-block">
+                <div className="field-heading"><label htmlFor="speed">速度档位</label><strong>{speed} <span>/ 4</span></strong></div>
+                <input id="speed" className="brightness-range" type="range" min="0" max="4" step="1" value={speed} onChange={event => setSpeed(Number(event.target.value))} disabled={Boolean(busy)} />
+                <div className="range-labels"><span>最快</span><span>最慢</span></div>
+                <p className="field-note">payload[10] 越小越快：实机观察 0 最快、4 最慢，所以档位数字往右变大时动画反而变慢。</p>
+              </div>
+            </div>
+            <div className="field-block">
+              <div className="field-heading"><label htmlFor="brightness">亮度等级</label><strong>{brightness} <span>/ 4</span></strong></div>
+              <input id="brightness" className="brightness-range" type="range" min="0" max="4" step="1" value={brightness} onChange={event => setBrightness(Number(event.target.value))} disabled={Boolean(busy)} />
+              <div className="range-labels"><span>关闭</span><span>最亮</span></div>
+            </div>
+            <div className="field-line">
+              <label htmlFor="color">灯光颜色</label>
+              <div className="color-field"><input id="color" type="color" value={color} onChange={event => setColor(event.target.value)} disabled={Boolean(busy)} /><span>{color.toUpperCase()}</span></div>
+            </div>
+            <label className="toggle-line">
+              <span><strong>RGB 轮换</strong><small>payload[12] = 1，颜色随灯效流动</small></span>
+              <input type="checkbox" checked={colorMode === 'cycle'} onChange={event => setColorMode(event.target.checked ? 'cycle' : 'static')} disabled={Boolean(busy)} />
+              <span className="toggle-switch" />
+            </label>
+            <button className="panel-button" onClick={applyLighting} disabled={!hasDevice || Boolean(busy)}>{busy === '应用灯光' ? '正在发送…' : '应用灯光设置'} <span>→</span></button>
+          </section>
 
-          <section className="panel keymap-panel"><div className="panel-top"><div className="panel-icon key-icon">⌘</div><span className="panel-counter">02 — KEY MAPPING</span></div><h3>键位配置</h3><p className="panel-description">每次连接都会读取键盘当前配置。点击按键或滚轮方向，挑选你需要的动作。</p><div className="keymap-meta"><span><i className="meta-dot editable" /> 所有显示位置均可编辑</span><span><i className="meta-dot changed" /> 已更改键位</span><span className="meta-count">{keymap ? '当前配置 · 128 条记录' : '等待读取键位'}</span></div><div className="keyboard-scroll"><div className="keyboard"><div className="side-controls">{sideControls.map(control => { const appearance = keyAppearance(draft, control.index, control.label, pendingIndices.has(control.index)); return <button key={control.index} className={`key side-key ${selected === control.index ? 'selected' : ''} ${appearance.changed ? 'changed' : ''}`} disabled={!hasDevice || Boolean(busy)} onClick={() => setSelected(control.index)} title={keymap ? `${keyLabel(control.index)} · ${recordDescription(draft!, control.index)}` : control.label}><span>{control.icon}</span><small>{appearance.label}</small></button> })}</div><div className="main-keys">{KEY_ROWS.map((row, rowIndex) => <div className="keyboard-row" key={rowIndex}>{row.map(key => { const appearance = keyAppearance(draft, key.index, key.label, pendingIndices.has(key.index)); return <button key={key.index} className={`key ${selected === key.index ? 'selected' : ''} ${appearance.changed ? 'changed' : ''}`} style={{ '--key-width': key.width ?? 1, '--key-gap': key.gap ?? 0 } as React.CSSProperties} disabled={!hasDevice || Boolean(busy)} onClick={() => setSelected(key.index)} title={keymap ? `Record ${key.index} · ${recordDescription(draft!, key.index)}` : key.label}><span>{appearance.label}</span></button> })}</div>)}</div></div></div><div className="key-editor"><div className="editor-heading"><span>{selected === null ? '选择一个按键开始' : `${keyLabel(selected)} · Record ${selected.toString().padStart(3, '0')}`}</span><span className={`editor-badge ${selectedEditable ? 'editable' : ''}`}>{selected === null ? '未选择' : selectedEditable ? '可编辑' : '恢复预览中'}</span></div>{selectedRecord ? <><div className="editor-current"><span>当前动作</span><strong>{selectedAction?.label ?? recordDescription(draft!, selected!)}</strong><code>{hexRecord(selectedRecord)}</code></div>{selectedEditable ? <><label className="action-select-label">更改为<select value={selectedAction?.id ?? ''} onChange={event => stageAction(event.target.value)} disabled={Boolean(busy)}>{!selectedAction && <option value="" disabled>选择普通动作…</option>}{groups.map(group => <optgroup key={group} label={group}>{ACTIONS.filter(action => action.group === group).map(action => <option value={action.id} key={action.id}>{action.label}</option>)}</optgroup>)}</select></label><div className="macro-binding"><span>绑定板载宏</span><select value={bindingMacro} onChange={event => setBindingMacro(Number(event.target.value))}>{Array.from({ length: 10 }, (_, index) => <option value={index} key={index}>M{index + 1}</option>)}</select><select value={bindingMode} onChange={event => setBindingMode(event.target.value as MacroTriggerMode)}><option value="normal">正常停止</option><option value="release">释放停止</option><option value="press">按下停止</option><option value="repeat">播放次数</option></select>{bindingMode === 'repeat' && <input type="number" min="1" max="255" value={repeatCount} onChange={event => setRepeatCount(Math.min(255, Math.max(1, Number(event.target.value))))} />}<button onClick={stageMacroBinding} disabled={Boolean(busy) || macroDrafts.has(bindingMacro)}>暂存绑定</button></div>{macroDrafts.has(bindingMacro) && <p className="binding-note">请先保存 M{bindingMacro + 1}，再绑定到按键。</p>}</> : <p className="locked-explanation">正在预览备份恢复；取消恢复后即可编辑这个位置。</p>}</> : <p className="editor-empty">读取设备后，选择键盘上的按键查看实时记录。</p>}</div></section>
+          <section className="panel keymap-panel"><div className="panel-top"><div className="panel-icon key-icon">⌘</div><span className="panel-counter">02 — KEY MAPPING</span></div><h3>键位配置</h3><p className="panel-description">每次连接都会读取键盘当前配置。先选编辑模式：改键，或按 keymap record 索引逐键设置颜色。</p><div className="keymap-modes" role="group" aria-label="键位面板模式"><button className={keyMode === 'remap' ? 'selected' : ''} onClick={() => setKeyMode('remap')} disabled={Boolean(busy) || recording}>改键</button><button className={keyMode === 'color' ? 'selected' : ''} onClick={() => setKeyMode('color')} disabled={Boolean(busy) || recording}>逐键颜色</button></div><div className="keymap-meta">{keyMode === 'remap' ? <><span><i className="meta-dot editable" /> 所有显示位置均可编辑</span><span><i className="meta-dot changed" /> 已更改键位</span></> : <><span><i className="meta-dot editable" /> 颜色来自本地颜色表</span><span><i className="meta-dot changed" /> 已设置颜色</span></>}<span className="meta-count">{keyMode === 'remap' ? (keymap ? '当前配置 · 128 条记录' : '等待读取键位') : `已设置 ${coloredCount} / 128 个键`}</span></div><div className="keyboard-scroll"><div className="keyboard"><div className="side-controls">{sideControls.map(control => { const appearance = keyAppearance(draft, control.index, control.label, pendingIndices.has(control.index)); const paint = paintFor(control.index); const state = keyMode === 'color' ? paint.className : appearance.changed ? 'changed' : ''; return <button key={control.index} className={`key side-key ${selected === control.index ? 'selected' : ''} ${state}`} style={paint.style} disabled={!hasDevice || Boolean(busy)} onClick={() => setSelected(control.index)} title={keymap ? `${keyLabel(control.index)} · ${recordDescription(draft!, control.index)}` : control.label}><span>{control.icon}</span><small>{appearance.label}</small></button> })}</div><div className="main-keys">{KEY_ROWS.map((row, rowIndex) => <div className="keyboard-row" key={rowIndex}>{row.map(key => { const appearance = keyAppearance(draft, key.index, key.label, pendingIndices.has(key.index)); const paint = paintFor(key.index); const state = keyMode === 'color' ? paint.className : appearance.changed ? 'changed' : ''; return <button key={key.index} className={`key ${selected === key.index ? 'selected' : ''} ${state}`} style={{ '--key-width': key.width ?? 1, '--key-gap': key.gap ?? 0, ...paint.style } as React.CSSProperties} disabled={!hasDevice || Boolean(busy)} onClick={() => setSelected(key.index)} title={keymap ? `Record ${key.index} · ${recordDescription(draft!, key.index)}` : key.label}><span>{appearance.label}</span></button> })}</div>)}</div></div></div><div className="key-editor"><div className="editor-heading"><span>{selected === null ? '选择一个按键开始' : `${keyLabel(selected)} · Record ${selected.toString().padStart(3, '0')}`}</span><span className={`editor-badge ${(keyMode === 'color' ? selected !== null : selectedEditable) ? 'editable' : ''}`}>{selected === null ? '未选择' : keyMode === 'color' ? '逐键颜色' : selectedEditable ? '可编辑' : '恢复预览中'}</span></div>{keyMode === 'color' ? (selectedColor ? <div className="color-editor">
+              <div className="editor-current"><span>当前颜色</span><strong>{hexColor(selectedColor)}</strong><code>{hexColor(selectedColor)}</code></div>
+              <div className="color-palette">{PRESET_COLORS.map(preset => <button key={preset.hex} type="button" aria-label={preset.label} className={`color-swatch ${hexColor(selectedColor) === preset.hex ? 'selected' : ''}`} style={{ background: preset.hex }} title={`${preset.label} · ${preset.hex}`} onClick={() => applyKeyColor(preset.hex)} disabled={Boolean(busy)} />)}</div>
+              <div className="field-line"><label htmlFor="key-color">自定义颜色</label><div className="color-field"><input id="key-color" type="color" value={hexColor(selectedColor)} onChange={event => applyKeyColor(event.target.value)} disabled={Boolean(busy)} /><span>{hexColor(selectedColor)}</span></div></div>
+              <div className="color-actions"><button className="cancel-button" onClick={clearSelectedKeyColor} disabled={Boolean(busy)}>清除该键颜色</button><button className="cancel-button" onClick={clearAllKeyColors} disabled={Boolean(busy) || coloredCount === 0}>全部清除</button><button className="cancel-button" onClick={() => downloadColorMap(colorMap, 'leo87-perkey-colors.bin')} disabled={Boolean(busy)}>导出颜色表</button><button className="cancel-button" onClick={() => colorFileInput.current?.click()} disabled={Boolean(busy)}>导入颜色表</button><input ref={colorFileInput} type="file" accept=".bin,application/octet-stream" hidden onChange={event => { const file = event.target.files?.[0]; if (file) void importColorMap(file) }} /></div>
+              <p className="field-note">颜色表按 keymap 的 record 索引存放，每个 record 占 3 字节；`00 00 00` 是否表示关闭仍待实机确认。</p>
+              <div className="color-diff-head"><span>待写入差异</span><strong>{colorDifferences.length ? `${colorDifferences.length} 个键` : '无变更'}</strong></div>
+              <div className="diff-list">{colorDifferences.length ? colorDifferences.slice(0, 8).map(change => <div className="diff-item" key={change.index}><span>{keyLabel(change.index)}</span><code>{hexColor(change.before)} → {hexColor(change.after)}</code></div>) : <div className="diff-empty">点选键位并选择颜色后，差异会显示在这里。</div>}{colorDifferences.length > 8 && <div className="diff-more">另有 {colorDifferences.length - 8} 条差异</div>}</div>
+              <div className="write-actions"><button className="write-button" onClick={applyCustomColorMap} disabled={!hasDevice || colorDifferences.length === 0 || Boolean(busy)}>{busy === '应用逐键颜色' ? '正在写入…' : '应用到键盘'} <span>→</span></button></div>
+              <p className="color-note">应用时会自动先切到自定义灯效（0x13），再完整写入 128 条颜色记录。设备没有颜色表回读命令：颜色表只保存在本浏览器（{colorMapBackup ? `上次发送 ${formatDate(colorMapBackup.savedAt)}` : '尚未发送过'}）。</p>
+            </div> : <p className="editor-empty">读取设备后，选择键盘上的按键为该 record 设置颜色。</p>) : selectedRecord ? <><div className="editor-current"><span>当前动作</span><strong>{selectedAction?.label ?? recordDescription(draft!, selected!)}</strong><code>{hexRecord(selectedRecord)}</code></div>{selectedEditable ? <><label className="action-select-label">更改为<select value={selectedAction?.id ?? ''} onChange={event => stageAction(event.target.value)} disabled={Boolean(busy)}>{!selectedAction && <option value="" disabled>选择普通动作…</option>}{groups.map(group => <optgroup key={group} label={group}>{ACTIONS.filter(action => action.group === group).map(action => <option value={action.id} key={action.id}>{action.label}</option>)}</optgroup>)}</select></label><div className="macro-binding"><span>绑定板载宏</span><select value={bindingMacro} onChange={event => setBindingMacro(Number(event.target.value))}>{Array.from({ length: 10 }, (_, index) => <option value={index} key={index}>M{index + 1}</option>)}</select><select value={bindingMode} onChange={event => setBindingMode(event.target.value as MacroTriggerMode)}><option value="normal">正常停止</option><option value="release">释放停止</option><option value="press">按下停止</option><option value="repeat">播放次数</option></select>{bindingMode === 'repeat' && <input type="number" min="1" max="255" value={repeatCount} onChange={event => setRepeatCount(Math.min(255, Math.max(1, Number(event.target.value))))} />}<button onClick={stageMacroBinding} disabled={Boolean(busy) || macroDrafts.has(bindingMacro)}>暂存绑定</button></div>{macroDrafts.has(bindingMacro) && <p className="binding-note">请先保存 M{bindingMacro + 1}，再绑定到按键。</p>}</> : <p className="locked-explanation">正在预览备份恢复；取消恢复后即可编辑这个位置。</p>}</> : <p className="editor-empty">读取设备后，选择键盘上的按键查看实时记录。</p>}</div></section>
         </div>
 
         <section className="macro-section">

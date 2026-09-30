@@ -7,7 +7,7 @@ Leo87 Studio 是运行在桌面 Chrome 或 Edge 中的非官方网页驱动。�
 当前主要能力包括：
 
 - 连接和识别 Leo87 配置接口；
-- 灯光设置；
+- 灯效（动画）与逐键颜色设置；
 - 读取、展示和完整写回 keymap；
 - 键位、滚轮和媒体动作配置；
 - keymap 与宏数据的本地备份和恢复；
@@ -20,19 +20,24 @@ flowchart TD
     UI[React UI / App.tsx]
     KM[keymap.ts]
     MP[macro.ts]
+    LT[lighting.ts]
     KP[protocol.ts]
     DEV[device.ts]
-    BK[backup.ts / macroBackup.ts]
+    BK[backup.ts / macroBackup.ts / colorMapBackup.ts]
     HID[WebHID Report ID 4]
     KB[Leo87 Firmware]
 
     UI --> KM
     UI --> MP
+    UI --> LT
     UI --> BK
     UI --> DEV
     KM --> KP
+    LT --> KP
+    BK --> LT
     DEV --> KP
     DEV --> MP
+    DEV --> LT
     DEV --> HID
     HID --> KB
 ```
@@ -43,14 +48,24 @@ flowchart TD
 
 ### `src/protocol.ts`
 
-负责公共 HID 常量和 keymap、灯光协议：
+负责公共 HID 常量和 keymap、灯光报文：
 
 - 63 字节 payload 与 16 位小端累加校验和；
 - Begin、End、Current Config 报文；
-- 灯光报文；
+- 灯效（灯光）报文：`payload[8] = effectId`、`[9] = brightness`、`[10] = speed`（数值越小越快：0 最快、4 最慢）、`[12] = mode`、`[13..15] = RGB`，并校验亮度与速度的 0–4 档位；
 - `0x07`、`0x08` keymap 读取；
 - `0x09` keymap 写入；
 - 384 字节 keymap 和 3 字节 record 的读取、替换与差异比较。
+
+### `src/lighting.ts`
+
+负责灯光语义与逐键颜色表的纯数据处理（对照 `macro.ts` 的风格，不接触设备与浏览器 API）：
+
+- 实机确认过的灯效表 `EFFECT_OPTIONS`（`0x11` 不在表中）与下发前的白名单校验 `assertEffectId`；
+- 预设色板 `PRESET_COLORS`、`parseHexColor` / `hexColor`；
+- `0x0B` 逐键颜色表分段报文 `colorMapPacket`；
+- 384 字节颜色表的 `colorAt` / `withRecordColor` / `clearRecordColor` / `clearColorMap` / `diffColorMap` / `coloredRecordCount`；
+- 颜色表 record 索引与 keymap 完全一致，偏移为 `record × 3`，因此可以直接复用 `keymap.ts` 的物理布局。
 
 ### `src/macro.ts`
 
@@ -76,15 +91,18 @@ flowchart TD
 - 为每个读写请求注册临时 `inputreport` 监听器和超时；
 - 忽略与当前等待命令无关的 ACK；
 - 校验响应命令、长度、offset 和回显数据；
-- 完整执行 keymap 与宏的读取、写入和回读验证。
+- 完整执行 keymap 与宏的读取、写入和回读验证；
+- 发送灯效报文（`setLighting`，下发前做灯效白名单校验）与逐键颜色表（`setCustomColorMap`）。
 
 ### `src/keymap.ts`
 
 负责用户可选动作、键盘物理布局和 record 的人类可读描述。宏 trigger 也在这里转换成 `M1 · 正常停止` 等界面文本。
 
-### `src/backup.ts` 与 `src/macroBackup.ts`
+### `src/backup.ts`、`src/macroBackup.ts` 与 `src/colorMapBackup.ts`
 
-分别保存首次成功读取的 keymap 和宏数据。备份存放于当前站点的 `localStorage`，并支持导出为二进制文件。
+分别保存首次成功读取的 keymap、首次成功读取的宏数据，以及逐键颜色表的工作副本。三者都存放于当前站点的 `localStorage`，并支持导出为二进制文件。
+
+颜色表的差别在于设备没有对应的读取命令，所以 `colorMapBackup` 保存的不是“首次读取备份”，而是当前工作表：它在每次成功发送逐键颜色后才写入，导入文件必须是正好 384 字节。
 
 宏模块额外提供不经过布局校验的导出：`downloadRawMacro` 保存设备真实回送的原始转储，`downloadMacroReport` 保存诊断报告文本；只有 `downloadMacro` 会对字节做完整校验。这样在布局尚未确认时也能留证据，同时不给写入路径开口子。
 
@@ -93,7 +111,8 @@ flowchart TD
 负责页面状态和工作流：
 
 - 设备连接、重新读取和断开；
-- 灯光表单；
+- 灯光表单：灯效网格、亮度与速度档位、颜色与 RGB 轮换；
+- 键位面板的「改键 / 逐键颜色」模式切换、逐键取色、差异预览、应用与颜色表导入导出；
 - 键位选择、暂存、差异预览和写入；
 - M1–M10 选择、实时录制、延时修改和保存；
 - 宏触发绑定；
@@ -109,6 +128,13 @@ flowchart TD
 3. 使用 `Begin → Current Config → 7 × 0x08 → End` 读取当前 keymap；失败时回退到 `0x07`。
 4. keymap 成功后独立使用 `0x14` 读取宏数据。
 5. 宏读取或解析失败只更新宏错误状态，连接和 keymap 保持可用；同时保留设备真实回送的样本（布局错误为 56 字节探测窗口，解析错误为整段数据）并生成诊断报告，供导出与后续分析。
+
+### 灯效与逐键颜色
+
+1. 普通灯效只发送一条配置报文：`Begin → 0x06 27（effectId / brightness / speed / mode / RGB）→ End`，由键盘 MCU 自行生成动画。
+2. 逐键颜色在普通灯效之上多一层：颜色表是 384 字节 = 128 record × 3 字节，record 索引与 keymap 一致。
+3. 点击“应用到键盘”时使用同一个事务：`Begin → 自定义灯效 0x13 → 7 段 0x0B → End`，任一分段失败即中止且不发送结束帧。
+4. 设备没有颜色表的读取命令，因此不做回读校验；成功发送后把草稿记为“已发送基准”并写入本地工作表，界面文案只承诺“报文已发出”。
 
 ### Keymap 写入
 
@@ -244,10 +270,11 @@ used_end = 0x10 + entry_count × 2 + Σ (4 + action_count × 4)
 
 ## 8. 测试结构
 
-- `protocol.test.ts`：灯光、校验和、keymap 分段和 record 操作。
+- `protocol.test.ts`：灯效报文（含实机红色样例）、校验和、keymap 分段和 record 操作。
+- `lighting.test.ts`：灯效表与 `0x11` 白名单、亮度/速度档位、`0x0B` 分段报文与笔记样例头、record × 3 偏移、清除与差异、`#RRGGBB` 往返。
 - `keymap.test.ts`：键位描述、滚轮、媒体动作和宏触发显示。
 - `macro.test.ts`：实机 `entry_count = 1` 样本、10 entry 完整表、entry 头字段顺序、entry 序列化、offset 与 `used_end` 重算、槽位补建、90 条限制、触发 record、诊断报告，以及键位三级降级解析（含 `keyCode = 229` 的输入法场景与监视文本）。
-- `device.test.ts`：模拟 HID 设备上的读取、完整写入、ACK、超时、错位响应、写入中断、回读不一致，以及 `used_end` 越界时保留探测样本且不发送任何 `0x15`。
+- `device.test.ts`：模拟 HID 设备上的读取、完整写入、ACK、超时、错位响应、写入中断、回读不一致、`used_end` 越界时保留探测样本且不发送任何 `0x15`，以及逐键颜色的事务顺序、强制 `0x13` 灯效、长度非法不发报文与中途失败不发结束帧。
 
 常用验证命令：
 

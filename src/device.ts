@@ -5,6 +5,7 @@ import {
 import {
   MACRO_GET, MACRO_HEADER_PROBE, MACRO_SET, macroChunks, macroPacket, macroUsedEnd, parseMacroResponse, parseMacroStorage,
 } from './macro'
+import { CUSTOM_EFFECT_ID, assertEffectId, colorMapPacket, validateColorMap } from './lighting'
 
 export type HidInputEvent = { reportId: number; data: DataView }
 export type HidCollection = { usagePage: number; usage: number; inputReports: Array<{ reportId: number }>; outputReports: Array<{ reportId: number }> }
@@ -174,9 +175,32 @@ export class Leo87Connection {
   }
 
   async setLighting(lighting: Lighting): Promise<void> {
+    // 未确认的灯效 ID 不允许出现在报文里（例如实机尚未抓到的 0x11）。
+    assertEffectId(lighting.effectId)
     return this.exclusive(async () => {
       await this.device.sendReport(REPORT_ID, BEGIN_FRAME)
       await this.device.sendReport(REPORT_ID, lightPacket(lighting))
+      await this.device.sendReport(REPORT_ID, END_FRAME)
+    })
+  }
+
+  /**
+   * 完整写入 384 字节逐键颜色表：BEGIN → 自定义灯效 → 7 段 0x0B → END。
+   *
+   * 逐键颜色必须先切到自定义灯效才会生效，因此 `lighting` 的 effectId 由设备层强制为 `0x13`。
+   * 设备目前没有颜色表的读取命令，所以不做回读校验：发送成功只表示报文已发出，需观察键盘确认。
+   * 任一分段失败即中止，不再发送结束帧，避免留下半提交状态。
+   */
+  async setCustomColorMap(colorMap: Uint8Array, lighting: Lighting): Promise<void> {
+    validateColorMap(colorMap)
+    const custom: Lighting = { ...lighting, effectId: CUSTOM_EFFECT_ID }
+    assertEffectId(custom.effectId)
+    return this.exclusive(async () => {
+      await this.device.sendReport(REPORT_ID, BEGIN_FRAME)
+      await this.device.sendReport(REPORT_ID, lightPacket(custom))
+      for (const { offset, length } of chunks()) {
+        await this.device.sendReport(REPORT_ID, colorMapPacket(offset, colorMap.slice(offset, offset + length)))
+      }
       await this.device.sendReport(REPORT_ID, END_FRAME)
     })
   }
